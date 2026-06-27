@@ -126,6 +126,32 @@ def test_build_put_sell_order_capacity_guard():
                                 capacity=20_000)
 
 
+def test_build_option_sell_order_call():
+    o = ta.build_option_sell_order(ticker="AAPL", strike=200,
+                                   expiration="2026-01-16", limit=3.0,
+                                   quantity=2, option_type="C")
+    assert o.option_type == "C"
+    assert o.shares_to_cover == 200       # 100 × 2
+    assert o.credit == 600.0              # 3.0 × 100 × 2
+    assert "$200 CALL" in o.describe()
+
+
+def test_build_option_sell_order_coverage_guard():
+    # 3 calls need 300 shares covered, but only 2 are coverable.
+    with pytest.raises(ValueError):
+        ta.build_option_sell_order(ticker="AAPL", strike=200,
+                                   expiration="2026-01-16", limit=3.0,
+                                   quantity=3, option_type="C", max_contracts=2)
+
+
+def test_calls_coverable_nets_existing_short_calls():
+    assert ta.calls_coverable(500) == 5            # 500 / 100
+    assert ta.calls_coverable(500, 2) == 3         # minus 2 already written
+    assert ta.calls_coverable(150, 1) == 0         # 1 coverable − 1 = 0
+    assert ta.calls_coverable(50) == 0             # < 100 shares
+    assert ta.calls_coverable(None) is None
+
+
 # ── market hours / LIVE placement (fake client, no network) ──────────────────
 
 class _Resp:
