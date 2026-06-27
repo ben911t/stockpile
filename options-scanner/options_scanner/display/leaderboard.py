@@ -96,6 +96,24 @@ def _market_open(app_key: str, app_secret: str, callback_url: str,
     return trade_actions.market_is_open(client)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _covered_coverage(app_key: str, app_secret: str, callback_url: str,
+                      token_file: str, ticker: str) -> dict | None:
+    """Cached (60s) read-only covered-call coverage for `ticker`: shares held,
+    calls already written, and how many *new* covered calls remain. None when
+    Schwab is unreachable. Read-only."""
+    from stocks_shared.schwab_live import get_client
+    from options_scanner import trade_actions
+    try:
+        client = get_client(app_key, app_secret, callback_url, token_file)
+    except Exception:
+        return None
+    shares, short_calls = trade_actions.held_shares_and_short_calls(
+        client, ticker)
+    return {"shares": shares, "short_calls": short_calls,
+            "coverable": trade_actions.calls_coverable(shares, short_calls)}
+
+
 def _submit_put_order(scfg: dict, order, cap: dict | None,
                       paper: bool, fill: dict | None = None) -> dict:
     """Place (or paper-record) a confirmed put order. Returns {ok, msg}.
@@ -111,7 +129,8 @@ def _submit_put_order(scfg: dict, order, cap: dict | None,
     # the Trades tab expect; `order.credit` is the total (limit*100*qty).
     base = {"ticker": order.ticker, "strike": order.strike,
             "expiration": order.expiration, "quantity": order.quantity,
-            "credit": order.limit, "status": "open"}
+            "credit": order.limit, "status": "open",
+            "option_type": getattr(order, "option_type", "P")}
     if paper:
         rec = {**base, "paper": True}
         if fill:
@@ -168,7 +187,9 @@ def _investigate_put_dialog(c: dict, ticker_df: "pd.DataFrame | None" = None,
     _paper = bool((st.session_state.get("schwab_config") or {}).get("paper",
                                                                     True))
     _mode = "📝 PAPER" if _paper else "🔴 LIVE"
-    _title = f"🔍 Sell Put — {c['ticker']} {_spot_txt}{_earn_seg}  ·  {_mode}"
+    _word = "Call" if c.get("side") == "call" else "Put"
+    _title = (f"🔍 Sell {_word} — {c['ticker']} {_spot_txt}{_earn_seg}"
+              f"  ·  {_mode}")
 
     @st.dialog(_title, width="large")
     def _dlg() -> None:
@@ -193,6 +214,11 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
     ``options-scanner/assisted-put-selling-implementation-plan.md``.
     """
     from options_scanner import trade_actions
+
+    # Put (cash-secured) vs call (covered) — drives sizing, copy, and the order.
+    side = c.get("side", "put")
+    is_call = side == "call"
+    opt_type = "C" if is_call else "P"
 
     exp = datetime.strptime(c["expiration"], "%Y-%m-%d").strftime("%b %d '%y")
 
@@ -246,7 +272,18 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
                              scfg.get("token_file", ""))
            if scfg.get("app_key") else None)
     cap_amt = cap.get("amount") if cap else None
-    affordable = trade_actions.puts_affordable(cap_amt, c["strike"])
+    # Sizing cap: covered-call coverage (shares ÷ 100 net of calls written) for
+    # calls; cash-secured-put capacity for puts.
+    if is_call:
+        cov = (_covered_coverage(scfg.get("app_key", ""),
+                                 scfg.get("app_secret", ""),
+                                 scfg.get("callback_url", ""),
+                                 scfg.get("token_file", ""), str(c["ticker"]))
+               if scfg.get("app_key") else None)
+        affordable = (cov or {}).get("coverable")
+    else:
+        cov = None
+        affordable = trade_actions.puts_affordable(cap_amt, c["strike"])
     # Market-hours gate for Place Trade (None = unknown → fail safe, disabled).
     market_open = (_market_open(scfg.get("app_key", ""),
                                 scfg.get("app_secret", ""),
@@ -263,7 +300,7 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
     with title_l:
         st.markdown("### Contract")
     with title_r:
-        st.markdown("### Sell a cash-secured put")
+        st.markdown(f"### Sell a {'covered call' if is_call else 'cash-secured put'}")
 
     # Top row, top-aligned, so "Suggested limit" (top of the right panel) lines
     # up with the top of the tables. The disclaimers + Place Trade button go in
@@ -335,7 +372,19 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
                 max_value=(affordable if affordable and affordable >= 1 else None),
                 key=f"investigate_qty_{c['ticker']}_{c['strike']:g}_{c['expiration']}",
             )
-        if cap_amt is not None:
+        if is_call:
+            if cov is not None:
+                _aff = (f" · up to {affordable} covered call"
+                        f"{'s' if (affordable or 0) != 1 else ''}"
+                        if affordable is not None else "")
+                st.caption(
+                    f"Shares held **{cov.get('shares', 0):,.0f}** "
+                    f"({cov.get('short_calls', 0)} already in calls){_aff} "
+                    "(100 shares cover each call).")
+            else:
+                st.caption("Share coverage unavailable — connect Schwab "
+                           "(Accounts & Trading access required).")
+        elif cap_amt is not None:
             _aff = f" · up to {affordable}" if affordable is not None else ""
             st.caption(f"Cash for puts \\${cap_amt:,.0f}{_aff} "
                        f"(\\${c['strike'] * 100:,.0f} collateral each). "
@@ -347,14 +396,18 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         # Order preview + validation. `order_ok` gates the Place Trade button.
         order_ok = False
         try:
-            order = trade_actions.build_put_sell_order(
+            order = trade_actions.build_option_sell_order(
                 ticker=c["ticker"], strike=c["strike"],
                 expiration=c["expiration"], limit=float(limit),
-                quantity=int(qty), capacity=cap_amt,
+                quantity=int(qty), option_type=opt_type,
+                capacity=(None if is_call else cap_amt),
+                max_contracts=(affordable if is_call else None),
             )
+            _req = (f"covers {order.shares_to_cover} shares" if is_call
+                    else f"collateral ${order.collateral:,.0f}")
             st.success(
                 (f"{order.describe()} — credit ${order.credit:,.0f}, "
-                 f"collateral ${order.collateral:,.0f}.").replace("$", "\\$"))
+                 f"{_req}.").replace("$", "\\$"))
             order_ok = True
         except ValueError as exc:
             st.error(f"Can't build this order: {exc}")
@@ -411,13 +464,18 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         if _acct_cash is None:
             _acct_cash = _bal.get("cashBalance")
         _coll_avail = (cap or {}).get("amount")
-        # Collateral leads the bottom line, grouped with the cash figures so the
-        # requirement sits right next to what's available.
-        _cash_bits = [f"collateral **${order.collateral:,.0f}**"]
-        if _acct_cash is not None:
-            _cash_bits.append(f"account cash **${_acct_cash:,.2f}**")
-        if _coll_avail is not None:
-            _cash_bits.append(f"cash for puts **${_coll_avail:,.2f}**")
+        # Bottom line: for a covered call show the shares it ties up (and shares
+        # held); for a put show collateral next to the cash available.
+        if is_call:
+            _cash_bits = [f"covers **{order.shares_to_cover} shares**"]
+            if cov is not None:
+                _cash_bits.append(f"shares held **{cov.get('shares', 0):,.0f}**")
+        else:
+            _cash_bits = [f"collateral **${order.collateral:,.0f}**"]
+            if _acct_cash is not None:
+                _cash_bits.append(f"account cash **${_acct_cash:,.2f}**")
+            if _coll_avail is not None:
+                _cash_bits.append(f"cash for puts **${_coll_avail:,.2f}**")
         # Escape every $ so Streamlit markdown doesn't read $...$ as LaTeX math
         # (which eats the dollar signs and garbles the amounts).
         st.warning((
@@ -509,7 +567,7 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         try:
             from options_scanner.display.iv_chart import show_iv_chart
             show_iv_chart(
-                ticker_df, float(c["spot"]), "put", int(min_oi), int(top_n),
+                ticker_df, float(c["spot"]), side, int(min_oi), int(top_n),
                 buy=False, ticker=c["ticker"],
                 key_prefix=f"inv_{c['ticker']}_{c['strike']:g}_{c['expiration']}",
                 min_vol=int(min_vol), provider=provider,
@@ -607,11 +665,11 @@ def render_leaderboard(results: list[dict], mode: str, min_oi: int,
     leaderboard). `buy` flips the ranking so IV-cheap contracts float to
     the top. Shows an explanatory notice when nothing qualifies at all.
 
-    `allow_investigate` turns each Puts-board row into a selectable control
-    that opens the assisted put-selling dialog. The caller gates it to
-    watchlist + sell + Schwab; here it only ever attaches to the Puts board
-    (you can't sell-to-open a put from the Calls board). `provider` and the
-    per-ticker chains (looked up from `results`) feed the dialog's IV chart.
+    `allow_investigate` turns each board row into a selectable control that
+    opens the assisted selling dialog — a cash-secured put on the Puts board, a
+    covered call on the Calls board. The caller gates it to watchlist + sell +
+    Schwab. `provider` and the per-ticker chains (looked up from `results`) feed
+    the dialog's IV chart.
     """
     sides = [mode] if mode in ("call", "put") else ["call", "put"]
     headings = {"call": "Calls", "put": "Puts"}
@@ -636,7 +694,7 @@ def render_leaderboard(results: list[dict], mode: str, min_oi: int,
         if len(sides) > 1:
             st.markdown(f"**{headings[side]}**")
         _render_table(board, side, min_vol,
-                      investigate=(allow_investigate and side == "put"),
+                      investigate=(allow_investigate and side in ("put", "call")),
                       min_oi=min_oi, top_n=top_n, ticker_dfs=ticker_dfs,
                       ticker_earnings=ticker_earnings, provider=provider)
 
@@ -805,6 +863,7 @@ def _render_table(board: pd.DataFrame, side: str, min_vol: int,
     row = board.iloc[sel[0]]
     contract = {
         "ticker": str(row["ticker"]),
+        "side": side,
         "strike": float(row["strike"]),
         "expiration": str(row["expiration"]),
         "dte": int(row["dte"]),

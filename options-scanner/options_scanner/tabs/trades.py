@@ -198,11 +198,12 @@ def _submit_close(scfg: dict, trade: dict, limit: float, live: bool,
         return {"ok": False,
                 "msg": "Couldn't resolve the account — close NOT sent."}
     account_hash, mask = resolved
-    res = trade_actions.place_put_close_order(
+    res = trade_actions.place_option_close_order(
         client, ticker=trade.get("ticker"),
         strike=float(trade.get("strike", 0)),
         expiration=trade.get("expiration", ""), limit=float(limit),
-        quantity=close_qty, account_hash=account_hash)
+        quantity=close_qty, account_hash=account_hash,
+        option_type=trade.get("option_type", "P"))
     if not res["ok"]:
         return {"ok": False, "msg": f"Close rejected: {res['error']}"}
     # The buy-to-close is accepted but may sit working before it fills. Track it
@@ -405,7 +406,8 @@ def tab_trades() -> None:
         _pending_open = _store_status == "open" and working
         _disp_status = ((bs.get("status") or _store_status).lower()
                         if _store_status == "open" and bs else _store_status)
-        label = (f"{t.get('ticker', '?')} ${t.get('strike', '?')} PUT — "
+        _otw = "CALL" if t.get("option_type") == "C" else "PUT"
+        label = (f"{t.get('ticker', '?')} ${t.get('strike', '?')} {_otw} — "
                  f"{exp_disp} · {qty}x · {_disp_status}"
                  + ("  ·  📝 PAPER" if t.get("paper") else "  ·  🔴 LIVE"))
 
@@ -850,9 +852,10 @@ def tab_trades() -> None:
                 if st.session_state.get(_confirm_key):
                     _debit = close_limit * 100 * close_n
                     _of2 = f" of {qty}" if close_n < qty else ""
+                    _otw2 = "CALL" if t.get("option_type") == "C" else "PUT"
                     st.warning(
                         f"**Confirm close** — BUY TO CLOSE {close_n}{_of2} "
-                        f"{t.get('ticker')} ${t.get('strike')} PUT @ "
+                        f"{t.get('ticker')} ${t.get('strike')} {_otw2} @ "
                         f"${close_limit:.2f} (debit **${_debit:,.0f}**) · "
                         + ("🔴 **LIVE**" if close_live else "📝 **PAPER**"))
                     # Red Cancel, mirroring the Sell Put confirm panel; CSS

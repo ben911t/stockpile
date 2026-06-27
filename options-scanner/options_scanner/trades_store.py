@@ -8,6 +8,7 @@ personal trade data, not shipped state.
 Each record:
   id          unique short id
   ticker, strike, expiration (YYYY-MM-DD), quantity
+  option_type "P" (cash-secured put) or "C" (covered call); default "P"
   credit      credit per share received at open
   status      "open" | "closing" | "closed" | "expired" | "assigned"
               ("closing" = a live buy-to-close order is working but unfilled)
