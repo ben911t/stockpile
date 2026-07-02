@@ -3,12 +3,26 @@
 import argparse
 import logging
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 
 log = logging.getLogger(__name__)
+
+# Yahoo rate-limit handling for the scan loop — keep in sync with
+# options_scanner.tabs.portfolio (the Streamlit path). When a fetch raises
+# RateLimitError the scan waits and retries that ticker, up to _RL_MAX_RETRIES
+# times, _RL_WAIT_SECONDS apart, rather than failing (or, in the CLI, crashing).
+# Yahoo's throttle window often runs longer than a minute, so one short wait
+# isn't enough. Because Yahoo throttles per-IP, once the wait clears every
+# remaining ticker proceeds — but if one ticker burns its WHOLE budget and is
+# still throttled, further waiting is futile: give up and fail the remaining
+# throttled tickers fast. Worst case ≈ one ticker's full budget (4×30s), not
+# minutes per ticker.
+_RL_WAIT_SECONDS = 30   # seconds between rate-limit retries
+_RL_MAX_RETRIES = 4     # per-ticker retries before concluding the IP is throttled
 
 
 def detect_brokerage(content: bytes) -> str | None:
@@ -198,6 +212,54 @@ def scan_position(pos: dict, min_dte: int = 365, min_oi: int = 25,
     }
 
 
+def _scan_positions(positions: list[dict], min_dte: int, min_oi: int,
+                    max_delta: float, provider: str,
+                    schwab_config: dict | None):
+    """Yield (position, result) for each position, with Yahoo rate-limit
+    retry/backoff.
+
+    Mirrors the Streamlit path (options_scanner.tabs.portfolio): a throttled
+    ticker retries up to ``_RL_MAX_RETRIES`` times, ``_RL_WAIT_SECONDS`` apart;
+    once any ticker exhausts its budget the IP is treated as persistently
+    throttled and every remaining ticker fails fast. A generator so the caller
+    can print each ticker's results as the scan streams (rather than blocking
+    until the whole basket is done). ``RateLimitError`` is imported lazily so a
+    Schwab-only run never pulls in the Yahoo/yfinance stack.
+    """
+    from stocks_shared.yahoo import RateLimitError
+
+    rl_give_up = False  # a full retry budget didn't clear the throttle → stop
+    for i, pos in enumerate(positions):
+        ticker = pos["ticker"]
+        log.info("Scanning %s (%d/%d)...", ticker, i + 1, len(positions))
+        attempts = 0  # rate-limit retries used on THIS ticker
+        while True:
+            try:
+                result = scan_position(pos, min_dte, min_oi, max_delta,
+                                       provider=provider,
+                                       schwab_config=schwab_config)
+                break
+            except RateLimitError as exc:
+                if rl_give_up or attempts >= _RL_MAX_RETRIES:
+                    # Retry budget exhausted (or a prior ticker already
+                    # exhausted it). Yahoo throttles per-IP, so more waiting is
+                    # futile — fail this ticker and the rest fast.
+                    rl_give_up = True
+                    result = {"position": pos,
+                              "error": (f"{exc}. Yahoo is still throttling — "
+                                        "rescan in a few minutes, or use "
+                                        "--data-source schwab."),
+                              "df": pd.DataFrame(), "spot": None,
+                              "earnings_dates": [], "roll_close_costs": {}}
+                    break
+                attempts += 1
+                log.warning("Yahoo rate limit — retry %d/%d for %s in %ds "
+                            "(the scan will finish, just slower)...",
+                            attempts, _RL_MAX_RETRIES, ticker, _RL_WAIT_SECONDS)
+                time.sleep(_RL_WAIT_SECONDS)
+        yield pos, result
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S"
@@ -253,12 +315,10 @@ def main() -> None:
     from options_scanner.display.cli import print_results
 
     results = []
-    for i, pos in enumerate(positions):
-        ticker = pos["ticker"]
-        log.info("Scanning %s (%d/%d)...", ticker, i + 1, len(positions))
-        result = scan_position(pos, args.min_dte, args.min_oi, args.max_delta,
-                               provider=provider, schwab_config=schwab_config)
+    for pos, result in _scan_positions(positions, args.min_dte, args.min_oi,
+                                       args.max_delta, provider, schwab_config):
         results.append(result)
+        ticker = pos["ticker"]
 
         if result["error"]:
             print(f"  {ticker}: {result['error']}\n")

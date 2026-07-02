@@ -200,37 +200,44 @@ def inject_theme() -> None:
       margin: 0.5rem 0 !important;
     }}
 
-    /* ── Tabs ────────────────────────────────────────────────────────── */
-    [data-testid="stTabs"] [role="tablist"] {{
-      gap: 0;
-      border-bottom: 1px solid var(--osc-border);
-      background: transparent;
+    /* ── Tab bar ─────────────────────────────────────────────────────────
+       The nav is a segmented_control (key="osc_tabbar" container), not st.tabs,
+       so it can render only the active tab. Style it to read as underline tabs.
+       Scoped to .st-key-osc_tabbar so the data-source segmented_control keeps
+       its default pill look. */
+    .st-key-osc_tabbar [data-testid="stSegmentedControl"] {{
+      width: 100%;
     }}
-    [data-testid="stTabs"] [role="tab"] {{
+    .st-key-osc_tabbar [data-testid="stSegmentedControl"] > div {{
+      gap: 0 !important;
+      border-bottom: 1px solid var(--osc-border);
+      flex-wrap: wrap !important;
+      justify-content: flex-start !important;
+    }}
+    .st-key-osc_tabbar [data-testid="stSegmentedControl"] button {{
       padding: 0.65rem 1.1rem !important;
+      border: none !important;
+      border-bottom: 2px solid transparent !important;
       border-radius: 0 !important;
       background: transparent !important;
-      border-bottom: 2px solid transparent !important;
       color: var(--osc-ink-3) !important;
-      font-weight: 500;
-      font-size: 0.9rem;
+      font-weight: 500 !important;
+      font-size: 0.9rem !important;
     }}
     @media (prefers-reduced-motion: no-preference) {{
-      [data-testid="stTabs"] [role="tab"] {{
+      .st-key-osc_tabbar [data-testid="stSegmentedControl"] button {{
         transition: color 120ms ease, border-color 120ms ease;
       }}
     }}
-    [data-testid="stTabs"] [role="tab"]:hover {{
+    .st-key-osc_tabbar [data-testid="stSegmentedControl"] button:hover {{
       color: var(--osc-primary) !important;
+      background: transparent !important;
     }}
-    [data-testid="stTabs"] [role="tab"][aria-selected="true"] {{
+    .st-key-osc_tabbar [data-testid="stSegmentedControl"]
+      button[aria-checked="true"] {{
       color: var(--osc-primary) !important;
       border-bottom-color: var(--osc-primary) !important;
-      font-weight: 600;
-    }}
-    [data-testid="stTabs"] [role="tab"] p {{
-      font-weight: inherit !important;
-      font-size: inherit !important;
+      font-weight: 600 !important;
     }}
 
     /* ── Focus rings (restyled, never removed) ──────────────────────── */
@@ -682,6 +689,68 @@ def inject_theme() -> None:
       background: rgba(15, 23, 42, 0.92) !important;
       border-bottom: 1px solid {dp["border"]} !important;
     }}
+
+    /* ── Run indicator ───────────────────────────────────────────────────
+       Replace Streamlit's top-right "running man" with a spinner centered on
+       screen. The status widget lives in the DOM only while the script runs
+       (Streamlit removes it when idle), so restyling IT gives a run-only
+       overlay with no Python run-state plumbing. The 0.4s fade-in delay means
+       sub-second reruns (a checkbox, a selectbox) finish before the spinner
+       ever appears — only slower work (a scan) shows it, so quick interactions
+       don't flash a center-screen spinner. */
+    /* The toolbar/header is a transformed ancestor, so it becomes the
+       containing block for the fixed spinner (a % top resolves against the
+       toolbar's tiny height, pinning it up top) and its overflow would clip a
+       spinner moved below it. Use vh for the offset (always viewport-relative)
+       and let these boxes overflow so the lower-center spinner shows. */
+    [data-testid="stHeader"], [data-testid="stToolbar"] {{
+      overflow: visible !important;
+    }}
+    [data-testid="stStatusWidget"] {{
+      position: fixed !important;
+      top: 43vh !important;     /* just above center of the viewport, not the toolbar */
+      left: 50% !important;
+      transform: translate(-50%, -50%) !important;
+      z-index: 100000 !important;
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: center !important;
+      gap: 10px !important;
+      /* Streamlit clamps the toolbar widget to a short, overflow-hidden box,
+         which was chopping the spinner's top — let it size to its content. */
+      width: auto !important;
+      height: auto !important;
+      min-height: 0 !important;
+      max-height: none !important;
+      overflow: visible !important;
+      padding: 0 !important;
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      opacity: 0;
+      animation: osc-run-fade 0.12s linear 0.4s forwards;
+    }}
+    /* Hide the default running-man icon + "Running"/"Stop" label. */
+    [data-testid="stStatusWidget"] * {{ display: none !important; }}
+    /* Spinner drawn in the widget's place. */
+    [data-testid="stStatusWidget"]::before {{
+      content: "";
+      width: 88px;
+      height: 88px;
+      border: 8px solid var(--osc-border-strong);
+      border-top-color: var(--osc-primary);
+      border-radius: 50%;
+      animation: osc-spin 0.8s linear infinite;
+    }}
+    /* Label under the spinner. */
+    [data-testid="stStatusWidget"]::after {{
+      content: "Running…";
+      font: 600 1.15rem var(--osc-font);
+      color: var(--osc-fg);
+      letter-spacing: 0.02em;
+    }}
+    @keyframes osc-spin {{ to {{ transform: rotate(360deg); }} }}
+    @keyframes osc-run-fade {{ to {{ opacity: 1; }} }}
     </style>
     """
     st.markdown(css, unsafe_allow_html=True)

@@ -27,6 +27,7 @@ from options_scanner.display.scan_stamp import PROVIDER_LABELS, PROVIDER_COLORS
 from options_scanner.tabs.gex import tab_gex
 from options_scanner.tabs.live_charts import tab_live_charts
 from options_scanner.tabs.portfolio import tab_portfolio, tab_watchlist
+from options_scanner.tabs.rolls import tab_rolls
 from options_scanner.tabs.single import tab_single
 from options_scanner.tabs.spreads import tab_directional, tab_neutral, tab_spreads
 from options_scanner.tabs.trades import tab_trades
@@ -43,6 +44,26 @@ st.set_page_config(
 # every downstream widget renders in the redesigned visual language.
 inject_theme()
 register_altair_theme()
+
+# Keep widget values alive across tab switches. The lazy tab dispatch below
+# renders only the active tab, so a tab you navigate away from stops rendering —
+# and Streamlit garbage-collects the session_state of any widget not rendered
+# this run, resetting its inputs. Re-asserting a key at the top of the run
+# promotes it to the persistent (user) layer so it survives until the tab
+# renders again.
+#
+# BUT: write-restricted widgets (st.button, download_button, file_uploader,
+# data_editor, chart selections, …) RAISE if their key is set via session_state
+# (StreamlitValueAssignmentNotAllowedError). Every one of those stores a
+# bool / object / dict — never a plain str/int/float/tuple — so filtering by
+# type skips them safely while still persisting text/number/select/slider
+# inputs. (Scan *results* live under non-widget keys and persist regardless.)
+_PERSIST_TYPES = (str, int, float, tuple)
+for _k in list(st.session_state.keys()):
+    _v = st.session_state[_k]
+    # bool is an int subclass — exclude it so button/checkbox keys are skipped.
+    if isinstance(_v, _PERSIST_TYPES) and not isinstance(_v, bool):
+        st.session_state[_k] = _v
 
 
 # ── Legacy theme switcher (kept for backward-compat session_state keys) ─────
@@ -263,6 +284,11 @@ else:
 st.session_state["data_source"] = data_source
 st.session_state["schwab_config"] = _cfg_schwab if data_source == "schwab" else None
 st.session_state["moomoo_config"] = _cfg_moomoo if data_source == "moomoo" else None
+# Whether Schwab is configured *at all* (independent of the active source) — the
+# Roll tab needs this to tell "no broker configured" from "Schwab not selected".
+st.session_state["_schwab_configured"] = _schwab_configured
+# Schwab token file, so tabs can pass it to render_schwab_reauth_hint.
+st.session_state["_schwab_token_file"] = _cfg_schwab.get("token_file")
 
 # Pick up a re-authenticated Schwab token without a server restart. A fresh
 # token (re-auth button or schwab_auth.py) rewrites the token file; the
@@ -416,41 +442,44 @@ if _pending_toast:
         height=1, width=1,
     )
 
-(
-    panel_single, panel_watchlist, panel_trades, panel_portfolio, panel_gex,
-    panel_spreads, panel_directional, panel_neutral,
-    panel_live,
-) = st.tabs(
-    ["Single Ticker", "Watchlist", "Trades", "Portfolio", "GEX",
-     "Spreads", "Directional", "Neutral", "Live Charts"]
-)
+# ── Tab bar (lazy) ─────────────────────────────────────────────────────────
+# st.tabs runs EVERY tab's body on every rerun, so a cold load pays for all ten
+# tabs — including the ones that hit Schwab / the dashboard on render. A
+# session-state selector runs ONLY the active tab, so load cost is one tab
+# regardless of how many exist, and each tab's live data loads when you arrive.
+# Switching tabs is a rerun (native st.tabs switched purely client-side); that
+# rerun is the cost of laziness, and the center spinner covers it.
+TAB_NAMES = ["Single Ticker", "Watchlist", "Trades", "Roll", "Portfolio",
+             "GEX", "Spreads", "Directional", "Neutral", "Live Charts"]
+TAB_FUNCS = {
+    "Single Ticker": tab_single, "Watchlist": tab_watchlist,
+    "Trades": tab_trades, "Roll": tab_rolls, "Portfolio": tab_portfolio,
+    "GEX": tab_gex, "Spreads": tab_spreads, "Directional": tab_directional,
+    "Neutral": tab_neutral, "Live Charts": tab_live_charts,
+}
 
-with panel_single:
-    tab_single()
+# Programmatic tab switch requested by an action that then reran (e.g. placing a
+# trade from the watchlist dialog → "Trades", a roll from the Roll tab). Apply
+# it BEFORE the tab-bar widget instantiates so it becomes the selected tab —
+# this replaces the old JS that clicked the native tab button.
+st.session_state.setdefault("active_tab", TAB_NAMES[0])
+_goto_tab = st.session_state.pop("_osc_goto_tab", None)
+if _goto_tab in TAB_NAMES:
+    st.session_state["active_tab"] = _goto_tab
 
-with panel_watchlist:
-    tab_watchlist()
+with st.container(key="osc_tabbar"):
+    _sel = st.segmented_control(
+        "Section", TAB_NAMES, label_visibility="collapsed", key="active_tab",
+    )
 
-with panel_trades:
-    tab_trades()
-
-with panel_portfolio:
-    tab_portfolio()
-
-with panel_gex:
-    tab_gex()
-
-with panel_spreads:
-    tab_spreads()
-
-with panel_directional:
-    tab_directional()
-
-with panel_neutral:
-    tab_neutral()
-
-with panel_live:
-    tab_live_charts()
+# segmented_control returns None if the active chip is clicked again (deselect);
+# fall back to the last resolved tab so a page is always rendered. `active_tab`
+# is the widget key (can't be written post-instantiation), so the fallback is
+# tracked under a separate key.
+_active = _sel if _sel in TAB_FUNCS else st.session_state.get(
+    "_active_tab_resolved", TAB_NAMES[0])
+st.session_state["_active_tab_resolved"] = _active
+TAB_FUNCS[_active]()
 
 # ── Footer ───────────────────────────────────────────────────────────────
 ui_footer()

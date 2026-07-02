@@ -1,9 +1,10 @@
 """Cross-ticker IV+pp leaderboard for the Portfolio tab.
 
-Aggregates the top-N picks from every scanned ticker into one ranked
-table — "across the whole basket, which contracts have the richest
-IV+pp right now?" Shown for both the brokerage-CSV and watchlist input
-sources, above the per-ticker expanders.
+Shows every scanned ticker's top 3 contracts by IV+pp, grouped by ticker so a
+calm name is represented just as fully as an earnings-heavy one. The tickers are
+ordered by their single richest contract, and within a ticker the rows run
+best-first. Shown for both the brokerage-CSV and watchlist input sources, above
+the per-ticker expanders.
 
 Ranking reuses the same convention as the per-position tables and the
 IV chart (`compute.top_ranks`): sort by `signal_score` (descending in
@@ -112,6 +113,29 @@ def _covered_coverage(app_key: str, app_secret: str, callback_url: str,
         client, ticker)
     return {"shares": shares, "short_calls": short_calls,
             "coverable": trade_actions.calls_coverable(shares, short_calls)}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def coverage_map(app_key: str, app_secret: str, callback_url: str,
+                 token_file: str) -> dict | None:
+    """Cached (60s) covered-call coverage for EVERY held underlying, in one
+    Schwab positions fetch. {TICKER: {"shares", "short_calls", "coverable"}}.
+    None when Schwab is unreachable (caller then falls back to all-selectable).
+    Read-only — gates which watchlist Calls rows get a select checkbox, and
+    feeds the per-ticker expander labels with the real held-share count."""
+    from stocks_shared.schwab_live import get_client
+    from options_scanner import trade_actions
+    try:
+        client = get_client(app_key, app_secret, callback_url, token_file)
+    except Exception:
+        return None
+    raw = trade_actions.held_shares_and_short_calls_map(client)
+    return {
+        tkr: {"shares": rec["shares"], "short_calls": rec["short_calls"],
+              "coverable": trade_actions.calls_coverable(
+                  rec["shares"], rec["short_calls"])}
+        for tkr, rec in raw.items()
+    }
 
 
 def _submit_put_order(scfg: dict, order, cap: dict | None,
@@ -230,7 +254,8 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
     ann_txt = f"{c['ann_pct']:.1f}%" if c.get("ann_pct") is not None else "—"
     # Left snapshot table: contract terms. Right table: prices + liquidity.
     terms = [
-        ("Type", "Put"), ("Strike", f"${c['strike']:g}"), ("Expir", exp),
+        ("Type", "Call" if is_call else "Put"),
+        ("Strike", f"${c['strike']:g}"), ("Expir", exp),
         ("DTE", f"{c['dte']}"), ("IV", iv_txt), ("Delta", delta_txt),
         ("Ann%", ann_txt),
     ]
@@ -329,7 +354,7 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
                        + ". Set your own limit if you still want to place it.")
             model = trade_actions.model_limit(
                 spot=c.get("spot"), strike=c["strike"], dte=c["dte"],
-                iv=c.get("iv"),
+                iv=c.get("iv"), option_type=opt_type,
             )
             # Default to the richer of the IV-aligned model and the observed
             # market — never below the higher of mid/last, so a thin contract's
@@ -424,8 +449,9 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
     # Footer row: disclaimers (left) beside the Place Trade button (right).
     foot_l, foot_r = st.columns(_ratio, vertical_alignment="center")
     with foot_l:
-        st.caption("Sells puts only · never fires without your confirm · "
-                   "**Schwab only.**")
+        st.caption(
+            ("Sells covered calls only · " if is_call else "Sells puts only · ")
+            + "never fires without your confirm · **Schwab only.**")
         if paper:
             st.caption("📝 **Paper mode** (`paper=true`) — Confirm records a "
                        "simulated trade; no live order is sent.")
@@ -526,9 +552,12 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
                 # rendered before this dialog overlay) reflects the new trade
                 # without a manual browser refresh. Queue the toast for the NEXT
                 # run (emitted in run_app) — a toast created right before
-                # st.rerun() is discarded with the current run.
+                # st.rerun() is discarded with the current run. The rerun resets
+                # st.tabs to the first tab, so also ask run_app to switch to the
+                # Trades tab (where the new trade now shows).
                 st.session_state["_osc_toast"] = (
-                    _result["msg"] + "  See the Trades tab.")
+                    _result["msg"] + "  Shown on the Trades tab.")
+                st.session_state["_osc_goto_tab"] = "Trades"
                 st.rerun()
 
     # Failures stay in the dialog (a success path reruns + toasts above, so the
@@ -547,18 +576,28 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
             def _fmt_bal(k, v):
                 return f"{v:,.2f}%" if "percent" in k.lower() else _money(v)
 
+            # The bolded/hover-noted fields are the cash-secured-put capacity
+            # figures — meaningful for a put, but NOT the binding constraint for
+            # a covered call (which is collateralized by shares, shown above).
+            # So on the call side we drop the emphasis and reword the caption.
+            _notes = {} if is_call else _PUT_BALANCE_NOTES
             # Split the balances across two side-by-side tables (sorted, halved).
             _items = [(k, _fmt_bal(k, _bals[k])) for k in sorted(_bals)]
             _half = (len(_items) + 1) // 2
             _ac1, _ac2 = st.columns(2)
             with _ac1:
-                st.markdown(_kv_html(_items[:_half], _PUT_BALANCE_NOTES),
+                st.markdown(_kv_html(_items[:_half], _notes),
                             unsafe_allow_html=True)
             with _ac2:
-                st.markdown(_kv_html(_items[_half:], _PUT_BALANCE_NOTES),
+                st.markdown(_kv_html(_items[_half:], _notes),
                             unsafe_allow_html=True)
-            st.caption("Read-only. **Bold** rows are the ones that matter for "
-                       "cash-secured puts — hover any for what it means.")
+            if is_call:
+                st.caption("Read-only. A covered call is collateralized by your "
+                           "shares (coverage shown above), not these cash/margin "
+                           "balances — they're here for reference.")
+            else:
+                st.caption("Read-only. **Bold** rows are the ones that matter "
+                           "for cash-secured puts — hover any for what it means.")
 
     # IV-surface chart — full width at the bottom (how rich this put is vs the
     # rest of the chain).
@@ -577,23 +616,94 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
             st.caption("IV chart unavailable for this contract.")
 
 
+# ── Shared assisted-sell selection plumbing ──────────────────────────────────
+# Used by the cross-ticker leaderboard AND the per-ticker scan-results tables
+# (Single Ticker tab + the portfolio/watchlist Top-N expanders), so a selected
+# row anywhere opens the same Sell dialog.
+
+def contract_from_row(row: "pd.Series", side: str, ticker: str, *,
+                      next_earnings=None, spot_fallback=None) -> dict:
+    """Build the dialog's contract dict from one chain/leaderboard row.
+
+    `ticker` is passed explicitly because the per-ticker scan tables don't carry
+    a `ticker` column. `spot_fallback` supplies the spot when the row lacks a
+    `spot` column (the scan-results subset may not include one)."""
+    def _num(v):
+        try:
+            f = float(v)
+            return f if f == f else None  # NaN → None
+        except (TypeError, ValueError):
+            return None
+
+    idx = row.index
+    spot = _num(row.get("spot")) if "spot" in idx else None
+    if spot is None:
+        spot = spot_fallback
+    return {
+        "ticker": str(ticker),
+        "side": side,
+        "strike": float(row["strike"]),
+        "expiration": str(row["expiration"]),
+        "dte": int(row["dte"]),
+        "bid": _num(row.get("bid")),
+        "ask": _num(row.get("ask")),
+        "mid": _num(row.get("mid")),
+        "last": _num(row.get("last")) if "last" in idx else None,
+        "iv": _num(row.get("iv")) if "iv" in idx else None,
+        "spot": spot,
+        "delta": _num(row.get("delta")) if "delta" in idx else None,
+        "ann_pct": (_num(row.get("ann_yield_pct"))
+                    if "ann_yield_pct" in idx else None),
+        "volume": int(row.get("volume", 0) or 0),
+        "open_interest": int(row.get("open_interest", 0) or 0),
+        "next_earnings": next_earnings,
+    }
+
+
+def open_investigate(contract: dict, *, ticker_df, min_oi: int, top_n: int,
+                     min_vol: int, provider: str, guard_key: str) -> None:
+    """Open the Sell dialog for `contract`, but only on a NEW selection.
+
+    `guard_key` (one per selectable table) holds the last-opened contract so
+    dismissing the dialog doesn't immediately reopen it while the row stays
+    selected, and a fresh open clears that contract's stale confirm/result
+    state."""
+    sel_key = (f"{contract['ticker']}|{contract['strike']}|"
+               f"{contract['expiration']}")
+    if st.session_state.get(guard_key) != sel_key:
+        st.session_state[guard_key] = sel_key
+        _ck = f"{contract['ticker']}_{contract['strike']:g}_{contract['expiration']}"
+        st.session_state.pop(f"place_confirm_{_ck}", None)
+        st.session_state.pop(f"place_result_{_ck}", None)
+        _investigate_put_dialog(contract, ticker_df=ticker_df, min_oi=min_oi,
+                                top_n=top_n, min_vol=min_vol, provider=provider)
+
+
+# How many contracts each ticker contributes to the cross-ticker leaderboard.
+# Fixed so representation is equal across the basket — a quiet name shows just
+# as many rows as an earnings-heavy one, and no single ticker can flood the
+# board (the old "guarantee #1 + global fill" scheme let high-IV names win the
+# fill pool over and over, so calm names got a single row).
+_ROWS_PER_TICKER = 3
+
+
 def build_leaderboard(results: list[dict], side: str, min_oi: int,
                       top_n: int, min_vol: int = 0,
                       delta_range: tuple[float, float] | None = None,
                       buy: bool = False,
                       ) -> pd.DataFrame:
-    """Collect a "best per ticker, then fill" leaderboard for one side.
+    """Collect a "top N per ticker, grouped by ticker" leaderboard for one side.
 
-    `side` is "call" or "put". Selection:
+    `side` is "call" or "put". Every qualifying ticker contributes its top
+    ``_ROWS_PER_TICKER`` contracts (ranked by the active signal score — IV+pp
+    by default), so representation is equal across the basket. The rows are
+    then grouped by ticker (a ticker's contracts stay contiguous) and the
+    tickers are ordered by their single best contract's score, so the name
+    holding the richest contract leads; within a ticker the rows run best-first.
 
-      1. Each ticker's single best contract (its #1) is guaranteed a slot,
-         so every scanned ticker that has any qualifying option is
-         represented.
-      2. Remaining slots are filled with the next-best leftovers globally
-         (each ticker contributes at most `top_n`).
-      3. Total rows = 2× the number of tickers that have ≥1 qualifying
-         option, then everything is sorted by IV+pp so the richest float
-         to the top even when several come from the same ticker.
+    `top_n` is accepted for call-signature compatibility (it feeds the dialog
+    IV chart elsewhere) but no longer sizes the board — the per-ticker count is
+    fixed at ``_ROWS_PER_TICKER``.
 
     Returns a DataFrame with a `ticker` column, the chain columns, and a
     boolean `_is_ticker_top` flag (True for each ticker's #1 pick — used
@@ -619,7 +729,7 @@ def build_leaderboard(results: list[dict], side: str, min_oi: int,
             continue
         sub = (sub.sort_values([sort_col_for(sub), "open_interest"],
                                ascending=[buy, False])
-               .head(top_n).copy())
+               .head(_ROWS_PER_TICKER).copy())
         sub["ticker"] = res["position"]["ticker"]
         sub["_is_ticker_top"] = [True] + [False] * (len(sub) - 1)
         per_ticker.append(sub.reset_index(drop=True))
@@ -627,29 +737,19 @@ def build_leaderboard(results: list[dict], side: str, min_oi: int,
     if not per_ticker:
         return pd.DataFrame()
 
-    n_tickers = len(per_ticker)
-    target = 2 * n_tickers
-
-    # 1. Guarantee every ticker's #1 pick.
-    guaranteed = pd.concat([t.iloc[[0]] for t in per_ticker], ignore_index=True)
-
-    # 2. Fill remaining slots from the next-best leftovers globally.
-    leftovers = [t.iloc[1:] for t in per_ticker if len(t) > 1]
-    if leftovers:
-        pool = pd.concat(leftovers, ignore_index=True)
-        sc = sort_col_for(pool)
-        pool = pool.sort_values([sc, "open_interest"], ascending=[buy, False])
-        fill = pool.head(max(0, target - len(guaranteed)))
-        combined = pd.concat([guaranteed, fill], ignore_index=True)
-    else:
-        combined = guaranteed
-
-    # 3. Final display sort by signal (richest first when selling, cheapest
-    #    first when buying).
+    combined = pd.concat(per_ticker, ignore_index=True)
     sc = sort_col_for(combined)
-    combined = (combined.sort_values([sc, "open_interest"],
-                                     ascending=[buy, False])
-                .head(target).reset_index(drop=True))
+    # Order tickers by their single best contract's score, keep each ticker's
+    # rows together, and within a ticker keep best-first. `_rank` (each ticker's
+    # best score, broadcast to all its rows) is the primary key; `ticker` breaks
+    # ties so two names sharing a best score never interleave.
+    combined["_rank"] = combined.groupby("ticker")[sc].transform(
+        "min" if buy else "max")
+    combined = (combined.sort_values(
+                    ["_rank", "ticker", sc, "open_interest"],
+                    ascending=[buy, True, buy, False], kind="stable")
+                .drop(columns="_rank")
+                .reset_index(drop=True))
     return combined
 
 
@@ -684,6 +784,19 @@ def render_leaderboard(results: list[dict], mode: str, min_oi: int,
         for r in results
     }
 
+    # Covered-call coverage map (Calls board only): how many NEW covered calls
+    # each held position supports, so only rows you can actually cover get a
+    # select checkbox. One Schwab positions fetch, cached 60s. None = Schwab
+    # unreachable → fall back to the all-rows-selectable table.
+    coverage = None
+    if allow_investigate:
+        _scfg = st.session_state.get("schwab_config") or {}
+        if _scfg.get("app_key"):
+            coverage = coverage_map(_scfg.get("app_key", ""),
+                                    _scfg.get("app_secret", ""),
+                                    _scfg.get("callback_url", ""),
+                                    _scfg.get("token_file", ""))
+
     rendered_any = False
     for side in sides:
         board = build_leaderboard(results, side, min_oi, top_n, min_vol,
@@ -693,6 +806,16 @@ def render_leaderboard(results: list[dict], mode: str, min_oi: int,
         rendered_any = True
         if len(sides) > 1:
             st.markdown(f"**{headings[side]}**")
+        # Calls board, assisted mode: split into coverable (selectable) and
+        # not-coverable (plain, no checkbox) — you can only write a call you
+        # hold 100+ shares to cover. Coverage unknown (Schwab down) falls
+        # through to the normal single selectable table.
+        if allow_investigate and side == "call" and coverage is not None:
+            _render_calls_by_coverage(
+                board, coverage, min_vol, min_oi=min_oi, top_n=top_n,
+                ticker_dfs=ticker_dfs, ticker_earnings=ticker_earnings,
+                provider=provider)
+            continue
         _render_table(board, side, min_vol,
                       investigate=(allow_investigate and side in ("put", "call")),
                       min_oi=min_oi, top_n=top_n, ticker_dfs=ticker_dfs,
@@ -709,9 +832,49 @@ def render_leaderboard(results: list[dict], mode: str, min_oi: int,
               "traded."
         )
         return
-    st.caption("Shaded rows are each ticker's top pick; other rows fill in "
-               "the next-richest contracts across the basket.")
+    st.caption("Each ticker's top 3 contracts by IV+pp, grouped together and "
+               "ordered so the ticker holding the single richest contract "
+               "leads. Shaded rows are each ticker's #1 pick.")
     stamp_caption()
+
+
+def _render_calls_by_coverage(board: pd.DataFrame, coverage: dict, min_vol: int,
+                              *, min_oi: int, top_n: int,
+                              ticker_dfs: dict | None,
+                              ticker_earnings: dict | None,
+                              provider: str) -> None:
+    """Render the Calls leaderboard as two tables: coverable rows (selectable,
+    with a checkbox) and not-coverable rows (read-only, no checkbox).
+
+    A row is coverable when its ticker has >= 1 *new* covered call available
+    (shares held / 100, net of calls already written). Streamlit's dataframe
+    selection is all-or-nothing per table, so the only way to show a checkbox on
+    some rows but not others is to split them — which is exactly the ask.
+    """
+    def _coverable(tk) -> bool:
+        return ((coverage.get(str(tk).upper(), {}) or {}).get("coverable")
+                or 0) >= 1
+
+    mask = board["ticker"].map(_coverable)
+    coverable = board[mask].reset_index(drop=True)
+    blocked = board[~mask].reset_index(drop=True)
+
+    if not coverable.empty:
+        _render_table(coverable, "call", min_vol, investigate=True,
+                      min_oi=min_oi, top_n=top_n, ticker_dfs=ticker_dfs,
+                      ticker_earnings=ticker_earnings, provider=provider)
+    else:
+        st.info("None of your watchlist tickers have 100+ uncovered shares to "
+                "write a covered call against. Add a name you hold (or buy "
+                "shares) to enable assisted covered-call selling here.")
+
+    if not blocked.empty:
+        st.markdown("**Not coverable** — you don't hold 100 shares (net of "
+                    "calls already written) of these, so they can't be sold as "
+                    "covered calls (no select checkbox).")
+        _render_table(blocked, "call", min_vol, investigate=False,
+                      min_oi=min_oi, top_n=top_n, ticker_dfs=ticker_dfs,
+                      ticker_earnings=ticker_earnings, provider=provider)
 
 
 def _render_table(board: pd.DataFrame, side: str, min_vol: int,
@@ -835,64 +998,38 @@ def _render_table(board: pd.DataFrame, side: str, min_vol: int,
             st.caption(EARNINGS_WARN_LEGEND)
         return
 
-    # Assisted put-selling (Schwab, watchlist): each row is selectable, and
-    # picking one opens the investigate dialog (stub for now).
-    st.caption("🔍 **Select a put row** to investigate placing a cash-secured "
-               "put sell — Schwab assisted trade (preview).")
+    # Assisted selling (Schwab, watchlist): each row is selectable, and picking
+    # one opens the investigate dialog — covered call on the Calls board, cash-
+    # secured put on the Puts board.
+    if side == "call":
+        st.caption("🔍 **Select a call row** to investigate writing a covered "
+                   "call — Schwab assisted trade (preview).")
+    else:
+        st.caption("🔍 **Select a put row** to investigate placing a cash-"
+                   "secured put sell — Schwab assisted trade (preview).")
     event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
                          width="stretch", on_select="rerun",
-                         selection_mode="single-row", key="lb_investigate_put")
+                         selection_mode="single-row",
+                         key=f"lb_investigate_{side}")
     if _has_warn:
         st.caption(EARNINGS_WARN_LEGEND)
+    # Per-side open-guard key — Calls and Puts can both be selectable at once
+    # (opt_type "both"), so each table tracks its own last-opened contract; a
+    # shared key would make the two tables fight to reopen each other's dialog.
+    _guard_key = f"_lb_last_investigated_{side}"
     sel = event.selection.rows if hasattr(event, "selection") else []
     if not sel:
         # Deselecting clears the guard so re-selecting the SAME row reopens the
-        # dialog. Without this, sel_key still equals _lb_last_investigated and
-        # the open below is skipped (the bug where you had to pick another row
-        # first).
-        st.session_state["_lb_last_investigated"] = None
+        # dialog. Without this, sel_key still equals the guard and the open
+        # below is skipped (the bug where you had to pick another row first).
+        st.session_state[_guard_key] = None
         return
 
-    def _num(v):
-        try:
-            f = float(v)
-            return f if f == f else None  # NaN → None
-        except (TypeError, ValueError):
-            return None
-
     row = board.iloc[sel[0]]
-    contract = {
-        "ticker": str(row["ticker"]),
-        "side": side,
-        "strike": float(row["strike"]),
-        "expiration": str(row["expiration"]),
-        "dte": int(row["dte"]),
-        "bid": _num(row.get("bid")),
-        "ask": _num(row.get("ask")),
-        "mid": _num(row.get("mid")),
-        "last": _num(row.get("last")) if "last" in board.columns else None,
-        "iv": _num(row.get("iv")) if "iv" in board.columns else None,
-        "spot": _num(row.get("spot")) if "spot" in board.columns else None,
-        "delta": _num(row.get("delta")) if "delta" in board.columns else None,
-        "ann_pct": (_num(row.get("ann_yield_pct"))
-                    if "ann_yield_pct" in board.columns else None),
-        "volume": int(row["volume"]),
-        "open_interest": int(row["open_interest"]),
-    }
-    contract["next_earnings"] = (ticker_earnings or {}).get(contract["ticker"])
-    # Only open the modal on a *new* selection, so dismissing it doesn't
-    # immediately reopen on the next rerun while the row stays selected.
-    sel_key = f"{contract['ticker']}|{contract['strike']}|{contract['expiration']}"
-    if st.session_state.get("_lb_last_investigated") != sel_key:
-        st.session_state["_lb_last_investigated"] = sel_key
-        # Fresh open: drop any stale confirm/result state for this contract so
-        # the Place Trade section starts collapsed (it persisted in
-        # session_state across a dismiss). Key mirrors _ck in the dialog body.
-        _ck = f"{contract['ticker']}_{contract['strike']:g}_{contract['expiration']}"
-        st.session_state.pop(f"place_confirm_{_ck}", None)
-        st.session_state.pop(f"place_result_{_ck}", None)
-        _investigate_put_dialog(
-            contract,
-            ticker_df=(ticker_dfs or {}).get(contract["ticker"]),
-            min_oi=min_oi, top_n=top_n, min_vol=min_vol, provider=provider,
-        )
+    _tk = str(row["ticker"])
+    contract = contract_from_row(
+        row, side, _tk, next_earnings=(ticker_earnings or {}).get(_tk))
+    open_investigate(
+        contract, ticker_df=(ticker_dfs or {}).get(_tk),
+        min_oi=min_oi, top_n=top_n, min_vol=min_vol, provider=provider,
+        guard_key=_guard_key)

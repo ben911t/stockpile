@@ -31,7 +31,7 @@ import streamlit as st
 from stocks_shared.yahoo import RateLimitError
 
 from options_scanner.display.iv_chart import show_iv_chart
-from options_scanner.display.leaderboard import render_leaderboard
+from options_scanner.display.leaderboard import coverage_map, render_leaderboard
 from options_scanner.display.portfolio_action_card import render_portfolio_action_card
 from options_scanner.display.scan_results import show_scan_results
 from options_scanner.display.spot_meta import (
@@ -48,14 +48,18 @@ from options_scanner.ui_theme import (
 from options_scanner import watchlists
 
 # Yahoo rate-limit handling: when a fetch raises RateLimitError, the scan
-# waits once and retries that ticker rather than failing it — large
-# baskets may pause this way several times and still finish. But if a
-# ticker is *still* throttled after its wait, Yahoo is persistently
-# rate-limiting the whole IP (it throttles per-IP, not per-symbol), so
-# further waiting is pointless: the scan stops waiting and fails the
-# remaining throttled tickers fast. Worst case ≈ one wait, not minutes
-# per ticker.
-_RL_WAIT_SECONDS = 60
+# waits and retries that ticker — up to _RL_MAX_RETRIES times, _RL_WAIT_SECONDS
+# apart — rather than failing it. Yahoo's throttle window often runs longer than
+# a minute, so a single short wait isn't enough (that was the bug: the scan gave
+# up after one 60s wait and skipped the rest). Because Yahoo throttles per-IP,
+# not per-symbol, retrying every 30s means that the moment the throttle lifts,
+# every remaining ticker sails through — so a large basket usually pays the wait
+# only once, near the start. But if one ticker burns its WHOLE retry budget and
+# is still throttled, the IP is persistently limited and further waiting is
+# pointless: the scan stops waiting and fails the remaining throttled tickers
+# fast. Worst case ≈ one ticker's full budget (4×30s), not minutes per ticker.
+_RL_WAIT_SECONDS = 30   # seconds between rate-limit retries
+_RL_MAX_RETRIES = 4     # per-ticker retries before concluding the IP is throttled
 
 
 @st.cache_data(show_spinner=False)
@@ -200,7 +204,7 @@ def _parse_watchlist(text: str) -> list[str]:
 
 def _scan_one(pos: dict, opt_type_key: str, scan_mode_key: str,
               provider: str, scfg: dict | None,
-              min_dte: int, max_dte: int) -> dict:
+              min_dte: int, max_dte: int | None) -> dict:
     """Fetch + enrich one position and build its result dict.
 
     Shared by both input sources. Watchlist tickers pass a synthetic
@@ -212,7 +216,7 @@ def _scan_one(pos: dict, opt_type_key: str, scan_mode_key: str,
         ticker, int(min_dte), provider, scfg,
         moomoo_config=st.session_state.get("moomoo_config"),
         opt_type=opt_type_key,
-        max_dte=int(max_dte),
+        max_dte=(int(max_dte) if max_dte is not None else None),
     )
 
     # Roll close cost lookup — only in Roll mode, only for open options
@@ -337,7 +341,10 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
             # for the loaded watchlist.
             st.session_state[f"{k}_wl_name"] = entry["name"]
             st.session_state[f"{k}_min_dte"]  = max(1, int(entry.get("min_dte", 30)))
-            st.session_state[f"{k}_max_dte"]  = max(1, int(entry.get("max_dte", 90)))
+            # A saved watchlist with no max DTE (null/0) loads as an empty field.
+            _e_max = entry.get("max_dte", 90)
+            st.session_state[f"{k}_max_dte"]  = (max(1, int(_e_max)) if _e_max
+                                                 else None)
             st.session_state[f"{k}_min_oi"]   = max(0, int(entry.get("min_oi", 25)))
             st.session_state[f"{k}_min_vol"]  = max(0, int(entry.get("min_vol", 1)))
             st.session_state[f"{k}_delta"]    = (_dmin, _dmax)
@@ -381,12 +388,15 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                          disabled=not (watchlist_tickers and _name)):
                 _d = st.session_state.get(f"{k}_delta", (0.10, 0.70))
                 _was_update = _name.lower() in _names
+                # None (empty Max DTE) is saved as null = "no maximum".
+                _save_max = st.session_state.get(f"{k}_max_dte")
                 watchlists.save({
                     "name": _name,
                     "tickers": watchlist_tickers,
                     "option_type": st.session_state.get(f"{k}_opt_type", "Calls"),
                     "min_dte": int(st.session_state.get(f"{k}_min_dte", 30)),
-                    "max_dte": int(st.session_state.get(f"{k}_max_dte", 90)),
+                    "max_dte": (int(_save_max) if _save_max is not None
+                                else None),
                     "min_oi": int(st.session_state.get(f"{k}_min_oi", 25)),
                     "min_vol": int(st.session_state.get(f"{k}_min_vol", 1)),
                     "delta_min": float(_d[0]),
@@ -397,12 +407,15 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                 st.session_state["_wl_flash"] = (
                     f"{'Updated' if _was_update else 'Saved'} watchlist "
                     f"“{_name}” ({len(watchlist_tickers)} tickers).")
-                st.rerun()
+                # Defer the rerun (see the deferred-rerun note below the filter
+                # controls) — rerunning here, before those widgets render, drops
+                # their state and resets every field to its default.
+                st.session_state["_wl_pending_rerun"] = True
             if st.button("🗑 Delete", use_container_width=True,
                          disabled=_name.lower() not in _names):
                 watchlists.delete(_name)
                 st.session_state["_wl_flash"] = f"Deleted watchlist “{_name}”."
-                st.rerun()
+                st.session_state["_wl_pending_rerun"] = True
 
         if watchlist_tickers:
             st.caption(f"{len(watchlist_tickers)} ticker(s): "
@@ -461,8 +474,16 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
         port_min_dte = st.number_input("Min DTE", value=30, min_value=1,
                                        key=f"{k}_min_dte")
     with pc2:
-        port_max_dte = st.number_input("Max DTE", value=90, min_value=1,
-                                       key=f"{k}_max_dte")
+        # Nullable: empty = no maximum DTE (scan every expiration >= Min DTE).
+        # Seed the 90 default once so a fresh load isn't unbounded, but allow
+        # clearing the field (value=None makes the input nullable; a non-None
+        # value would snap a cleared field back to it).
+        st.session_state.setdefault(f"{k}_max_dte", 90)
+        port_max_dte = st.number_input(
+            "Max DTE", min_value=1, step=1, value=None, key=f"{k}_max_dte",
+            placeholder="No max",
+            help="Leave empty for no maximum DTE (every expiration ≥ Min DTE).")
+    _max_dte_arg = int(port_max_dte) if port_max_dte is not None else None
     with pc3:
         port_min_oi = st.number_input("Min OI", value=25, min_value=0,
                                       key=f"{k}_min_oi")
@@ -535,6 +556,16 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
     scan_mode_key = {"Roll": "roll", "Best option": "best"}[scan_mode_label]
     _side = {"calls": "call", "puts": "put", "both": "both"}[opt_type_key]
 
+    # Deferred rerun for Save/Delete above. Streamlit drops the session state of
+    # any widget that isn't instantiated during a run, so calling st.rerun()
+    # straight from the Save handler — which sits ABOVE these filter controls —
+    # reruns before they render and snaps every field back to its default (most
+    # visibly: a cleared Max DTE re-seeds 90). Deferring the rerun to here, after
+    # all the control widgets have rendered, keeps their values intact while
+    # still refreshing the saved-watchlists list and showing the flash.
+    if st.session_state.pop("_wl_pending_rerun", False):
+        st.rerun()
+
     # Invalidate stored results when the file, format, watchlist, or scan
     # semantics change. Each tab keeps its own results + cache key.
     _results_key = "watchlist_results" if is_watchlist else "portfolio_results"
@@ -547,7 +578,7 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
         buy,
         scope_open, scope_stock, scope_closed,
         int(port_min_dte),
-        int(port_max_dte),
+        _max_dte_arg,
     )
     if st.session_state.get(f"_{k}_cache_key") != _cache_key:
         st.session_state.pop(_results_key, None)
@@ -637,21 +668,24 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
 
         progress = st.progress(0, text="Scanning…")
         results = []
-        rl_give_up = False  # a wait didn't clear the throttle → stop waiting
+        rl_give_up = False  # a full retry budget didn't clear the throttle → stop
         for i, pos in enumerate(positions):
             pct = (i + 1) / len(positions)
             progress.progress(pct, text=f"Scanning {pos['ticker']} "
                                         f"({i+1}/{len(positions)})…")
-            waited = False  # this ticker already used its one wait
+            attempts = 0  # rate-limit retries used on THIS ticker
             while True:
                 try:
                     res = _scan_one(
                         pos, opt_type_key, scan_mode_key, _provider, _scfg,
-                        int(port_min_dte), int(port_max_dte),
+                        int(port_min_dte), _max_dte_arg,
                     )
                     break
                 except RateLimitError as exc:
-                    if rl_give_up or waited:
+                    if rl_give_up or attempts >= _RL_MAX_RETRIES:
+                        # Retry budget exhausted (or a prior ticker already
+                        # exhausted it). Yahoo throttles per-IP, so more waiting
+                        # is futile — fail this ticker and the rest fast.
                         rl_give_up = True
                         res = {"position": pos,
                                "error": (f"{exc}. Yahoo is still throttling "
@@ -660,13 +694,14 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                                "df": pd.DataFrame(), "spot": None,
                                "earnings_dates": [], "roll_close_costs": {}}
                         break
-                    waited = True
+                    attempts += 1
                     for left in range(_RL_WAIT_SECONDS, 0, -1):
                         progress.progress(
                             pct,
-                            text=(f"Yahoo rate limit — retrying "
-                                  f"{pos['ticker']} in {left}s (the scan "
-                                  f"will finish, just slower)…"))
+                            text=(f"Yahoo rate limit — retry "
+                                  f"{attempts}/{_RL_MAX_RETRIES} for "
+                                  f"{pos['ticker']} in {left}s (the scan will "
+                                  f"finish, just slower)…"))
                         time.sleep(1)
             results.append(res)
 
@@ -712,12 +747,31 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
             f"({', '.join(failed)}) — details in their sections below."
         )
 
+    # Roll scan mode is analysis only — the NetCr columns below show what a
+    # roll would net, but placing one happens on the dedicated Roll tab (live
+    # Schwab positions).
+    if stored_scan_mode == "roll":
+        st.caption("📋 Roll analysis only — to *place* a roll, use the **Roll** "
+                   "tab (live Schwab positions).")
+
     # ── Cross-ticker leaderboard — richest IV+pp across the whole basket ──────
     if len(results) > 1:
+        # Title names the strategy this leaderboard ranks — covered calls
+        # (Calls board), cash-secured puts (Puts board), or both — with the
+        # strategy words accent-colored so the intent reads at a glance. The
+        # old "Leaderboard" title line is dropped; this heading takes its size.
+        _accent = "color:var(--osc-accent);font-weight:700;"
+        _type_span = lambda t: f"<span style='{_accent}'>{t}</span>"
+        _type_label = {"call": "Covered Call",
+                       "put": "Cash-Secured Put"}.get(stored_side)
+        if _type_label:
+            _lb_title = f"Top {_type_span(_type_label)} Candidates"
+        else:  # both boards shown — name both strategies
+            _lb_title = (f"Top {_type_span('Covered Call')} &amp; "
+                         f"{_type_span('Cash-Secured Put')} Candidates")
         section_header(
-            title="Leaderboard",
+            title=_lb_title,
             subtitle="Richest IV+pp contracts across every scanned ticker.",
-            eyebrow="TOP CANDIDATES",
         )
         # Assisted put-selling (stub): a per-row "investigate" control on the
         # Puts board, gated to watchlist + sell + Schwab. Yahoo can only read
@@ -725,11 +779,14 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
         # options-scanner/assisted-put-selling-implementation-plan.md.
         _lb_provider = st.session_state.get("scan_provider", "yahoo")
         # Show the investigate control only when the *displayed* results came
-        # from a Schwab scan AND Schwab is still the currently-selected source.
-        # scan_provider is a per-scan snapshot, so toggling the data source away
-        # hides the control and toggling back to Schwab restores it (no rescan).
+        # from a Schwab scan AND Schwab is still the currently-selected source,
+        # in sell + best mode. Applies to BOTH the watchlist and the CSV
+        # portfolio — coverage comes from live Schwab positions (the source of
+        # truth on this tab), so it stays consistent with the per-ticker tables
+        # and the expander labels. scan_provider is a per-scan snapshot, so
+        # toggling the source away hides the control and back restores it.
         _allow_investigate = (
-            is_watchlist and not stored_buy
+            not stored_buy and stored_scan_mode != "roll"
             and _lb_provider == "schwab"
             and st.session_state.get("data_source") == "schwab"
         )
@@ -739,22 +796,64 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                            allow_investigate=_allow_investigate,
                            provider=_lb_provider)
 
+    # Live Schwab coverage for the whole basket (one cached positions fetch) —
+    # the SINGLE source of truth on this tab whenever the scan ran on Schwab.
+    # Drives the expander labels, the SHARES card, the per-ticker Top-N
+    # checkboxes, AND the leaderboard checkboxes, so they all agree and reflect
+    # today's trades (the CSV's own FIFO counts are stale / a different account).
+    # None when Schwab is unreachable or not the scan source → fall back to CSV.
+    _cov_map = None
+    if st.session_state.get("scan_provider") == "schwab":
+        _scfg = st.session_state.get("schwab_config") or {}
+        if _scfg.get("app_key"):
+            _cov_map = coverage_map(_scfg.get("app_key", ""),
+                                    _scfg.get("app_secret", ""),
+                                    _scfg.get("callback_url", ""),
+                                    _scfg.get("token_file", ""))
+
+    # Assisted sell on the per-ticker Top-N tables: Schwab reachable + currently
+    # selected + sell + best-option mode.
+    _inv_on = (_cov_map is not None
+               and st.session_state.get("data_source") == "schwab"
+               and not stored_buy and stored_scan_mode != "roll")
+
     for res in results:
         pos    = res["position"]
         ticker = pos["ticker"]
 
-        # Build a compact expander label summarising what this position holds.
-        shares_str = f"{pos['shares']:g} shares" if pos["shares"] > 0 else "no shares"
+        # Build a compact expander label. Live Schwab is the source of truth on
+        # this tab whenever available (so it matches the checkboxes and reflects
+        # today's trades); otherwise fall back to the CSV's own FIFO count.
+        _cov = (_cov_map.get(str(ticker).upper()) if _cov_map is not None
+                else None)
+        if _cov_map is not None:
+            _sh = (_cov or {}).get("shares", 0.0)
+            _sc = int((_cov or {}).get("short_calls", 0))
+            _uncov = max(0.0, _sh - _sc * 100)
+            if _sh <= 0:
+                shares_str = "no shares"
+            elif _uncov > 0:
+                shares_str = f"{_sh:g} shares ({_uncov:g} uncovered)"
+            else:
+                shares_str = f"{_sh:g} shares (all covered)"
+        else:
+            shares_str = (f"{pos['shares']:g} shares" if pos["shares"] > 0
+                          else "no shares")
         label_parts = [ticker, shares_str]
-        if stored_opt_type in ("calls", "both") and pos["open_calls"]:
-            n = sum(o["contracts"] for o in pos["open_calls"])
-            label_parts.append(f"{n} short call(s)")
+        # Short-call count: live when on Schwab, else the CSV's open calls.
+        if stored_opt_type in ("calls", "both"):
+            _ncalls = (int((_cov or {}).get("short_calls", 0))
+                       if _cov_map is not None
+                       else sum(o["contracts"] for o in pos["open_calls"]))
+            if _ncalls:
+                label_parts.append(f"{_ncalls} short call(s)")
+        # Short puts aren't tracked in the live coverage map; show the CSV's.
         if stored_opt_type in ("puts", "both") and pos["open_puts"]:
             n = sum(o["contracts"] for o in pos["open_puts"])
             label_parts.append(f"{n} short put(s)")
         label = " — ".join(label_parts)
 
-        with st.expander(label, expanded=True):
+        with st.expander(label, expanded=False):
             if res["error"]:
                 st.error(res["error"])
                 continue
@@ -764,8 +863,14 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
             df             = res["df"]
 
             if spot is None or df.empty:
-                st.warning("No options data returned — Yahoo may be "
-                           "throttling. Try again in a moment.")
+                if st.session_state.get("scan_provider") == "schwab":
+                    st.warning("No options data returned from Schwab for this "
+                               "ticker — its chain may be empty (illiquid or no "
+                               "listed options at these filters), or the symbol "
+                               "may be unavailable.")
+                else:
+                    st.warning("No options data returned — Yahoo may be "
+                               "throttling. Try again in a moment.")
                 continue
 
             m1, m2, m3, m4 = st.columns(4)
@@ -784,7 +889,12 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                             spot_value_html(spot, _meta["pct_change"]),
                             help_text=spot_help_text(_meta))
             with m2:
-                metric_card("SHARES", f"{pos['shares']:,g}" if pos["shares"] > 0 else "—")
+                # Live Schwab shares when available (source of truth), else CSV.
+                _card_sh = ((_cov or {}).get("shares") if _cov_map is not None
+                            else pos["shares"])
+                metric_card("SHARES",
+                            f"{_card_sh:,g}" if _card_sh and _card_sh > 0
+                            else "—")
             with m3:
                 metric_card("EXPIRATIONS", f"{df['expiration'].nunique()}")
             with m4:
@@ -877,9 +987,21 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                     )
 
             st.markdown("**Top candidates**")
+            _inv_ctx = None
+            if _inv_on:
+                _inv_ctx = {
+                    "ticker": ticker,
+                    "ticker_df": df,
+                    "provider": st.session_state.get("scan_provider", "schwab"),
+                    "next_earnings": (earnings_dates[0] if earnings_dates
+                                      else None),
+                    "spot": spot,
+                    "key_prefix": f"{k}_{ticker}",
+                    "coverage": _cov,
+                }
             show_scan_results(df_filt, stored_side, stored_buy, _table_roll_close,
                                int(port_min_oi), int(port_top),
-                               int(port_min_vol))
+                               int(port_min_vol), investigate_ctx=_inv_ctx)
 
     # Portfolio HTML download
     from options_scanner.report import render_portfolio_html

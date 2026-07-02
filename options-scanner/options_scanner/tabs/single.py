@@ -628,6 +628,8 @@ def tab_single() -> None:
     if rcc is not None:
         st.info(f"Rolling {res['roll_type']} {fmt_strike(res['roll_strike'])} "
                 f"{res['roll_exp_str']} — close cost (mid): **${rcc:.2f}**")
+        st.caption("📋 Analysis only — to *place* a roll on a position you hold, "
+                   "use the **Roll** tab (live Schwab positions).")
 
     # Rescan button (fixed to header bar) + scan-criteria summary on
     # the same row. The button container is position:fixed via CSS so
@@ -693,9 +695,33 @@ def tab_single() -> None:
                           res.get("min_vol", 0), top_ranks=top_ranks)
 
     st.subheader("Top candidates — all chains")
+    # Assisted sell (Schwab, sell mode, not rolling): make these rows selectable
+    # so a covered call / cash-secured put can be placed straight from here. For
+    # calls the ticker's live Schwab share coverage gates selectability.
+    _inv_ctx = None
+    _ds = st.session_state.get("data_source", "yahoo")
+    _scfg = st.session_state.get("schwab_config") or {}
+    if _ds == "schwab" and not buy_r and rcc is None and _scfg.get("app_key"):
+        _cov = None
+        if mode_r in ("call", "both"):
+            from options_scanner.display.leaderboard import coverage_map
+            _cmap = coverage_map(_scfg.get("app_key", ""),
+                                 _scfg.get("app_secret", ""),
+                                 _scfg.get("callback_url", ""),
+                                 _scfg.get("token_file", ""))
+            _cov = (_cmap or {}).get(str(ticker_r).upper())
+        _inv_ctx = {
+            "ticker": ticker_r,
+            "ticker_df": df_fit_full,
+            "provider": _ds,
+            "next_earnings": ed[0] if ed else None,
+            "spot": spot,
+            "key_prefix": f"single_{ticker_r}",
+            "coverage": _cov,
+        }
     show_scan_results(df_filt, mode_r, buy_r, rcc,
                        res["min_oi"], res["top_n"],
-                       res.get("min_vol", 0))
+                       res.get("min_vol", 0), investigate_ctx=_inv_ctx)
 
     # ── Monte Carlo trade analyzer ────────────────────────────────────────
     # Pick any candidate from the ranked table above and simulate its

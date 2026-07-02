@@ -115,13 +115,17 @@ def assess_fill(*, bid, ask, mid=None, volume=None, open_interest=0,
     return FillAssessment(liquid, suggested, reasons, notes)
 
 
-def model_limit(*, spot, strike, dte, iv) -> float | None:
-    """IV-aligned limit — the Black-Scholes put price at the contract's own IV.
+def model_limit(*, spot, strike, dte, iv, option_type: str = "put"
+                ) -> float | None:
+    """IV-aligned limit — the Black-Scholes price at the contract's own IV.
 
     Anchors the limit to the option's implied vol (which carries the IV+pp
     edge) rather than a wide/thin market mid that may not be a meaningful
-    number. Used on the illiquid path to still propose a price, even though a
-    fill there is unlikely. Returns None when inputs are missing/degenerate.
+    number. `option_type` ("call"/"put", or "C"/"P") picks which side to price —
+    a covered call must use the call price, not the (often far pricier ITM) put
+    at the same strike. Used on the illiquid path to still propose a price, even
+    though a fill there is unlikely. Returns None when inputs are missing/
+    degenerate.
     """
     if spot is None or iv is None or not dte:
         return None
@@ -130,8 +134,9 @@ def model_limit(*, spot, strike, dte, iv) -> float | None:
     T = dte / 365.0
     if T <= 0:
         return None
+    kind = "call" if str(option_type).lower() in ("c", "call") else "put"
     from stocks_shared.black_scholes import bs_price
-    price = bs_price(spot, strike, T, RISK_FREE_RATE, iv, "put")
+    price = bs_price(spot, strike, T, RISK_FREE_RATE, iv, kind)
     return round_to_tick(price) if price > 0 else None
 
 
@@ -233,6 +238,164 @@ def calls_coverable(long_shares: float | None,
                - int(existing_short_calls or 0))
 
 
+def _account_positions(client, account_hash: str | None = None) -> list[dict]:
+    """Raw Schwab positions list for the account — ONE positions fetch. [] on
+    any failure. Resolves the first linked account when `account_hash` is
+    omitted. Shared by every positions reader below so the account round-trip
+    happens once per caller. Read-only."""
+    try:
+        from schwab.client import Client
+        if account_hash is None:
+            account_hash = client.get_account_numbers().json()[0]["hashValue"]
+        acct = (client.get_account(
+            account_hash, fields=Client.Account.Fields.POSITIONS)
+            .json().get("securitiesAccount", {}))
+        return acct.get("positions", []) or []
+    except Exception:
+        return []
+
+
+def _parse_option_symbol(symbol: str):
+    """Parse a Schwab/OSI option symbol → (root, expiration_iso, "C"/"P",
+    strike). None when it isn't a well-formed option symbol.
+
+    Inverse of ``_osi`` / schwab-py's ``OptionSymbol.build``: a left-justified
+    root followed by a fixed 15-char tail ``YYMMDD`` + ``C``|``P`` + an 8-digit
+    strike (price × 1000). E.g. ``"AMD   260116C00200000"`` → ("AMD",
+    "2026-01-16", "C", 200.0)."""
+    if not symbol:
+        return None
+    s = str(symbol).strip()
+    if len(s) < 16:  # need at least a 1-char root + the 15-char tail
+        return None
+    tail, root = s[-15:], s[:-15].strip()
+    yy, mm, dd, cp, strike_raw = (tail[0:2], tail[2:4], tail[4:6],
+                                  tail[6].upper(), tail[7:15])
+    if cp not in ("C", "P") or not (yy + mm + dd + strike_raw).isdigit():
+        return None
+    try:
+        exp_iso = f"{2000 + int(yy):04d}-{mm}-{dd}"
+        strike = int(strike_raw) / 1000.0
+    except ValueError:
+        return None
+    return root, exp_iso, cp, strike
+
+
+def held_shares_and_short_calls_map(client, account_hash: str | None = None
+                                    ) -> dict[str, dict]:
+    """{TICKER: {"shares": float, "short_calls": int}} for every underlying with
+    a position in the account — ONE Schwab positions fetch for the whole basket
+    (vs. one call per ticker). Lets the watchlist Calls board gate which rows are
+    coverable without N round-trips. Resolves the first linked account when
+    `account_hash` is omitted. Read-only; returns {} on any failure so callers
+    degrade to "no coverage" rather than erroring.
+    """
+    out: dict[str, dict] = {}
+    for p in _account_positions(client, account_hash):
+        inst = p.get("instrument", {}) or {}
+        atype = str(inst.get("assetType", "")).upper()
+        if atype == "EQUITY":
+            tkr = str(inst.get("symbol", "")).upper()
+            if not tkr:
+                continue
+            rec = out.setdefault(tkr, {"shares": 0.0, "short_calls": 0})
+            rec["shares"] += float(p.get("longQuantity", 0) or 0)
+        elif (atype == "OPTION"
+              and str(inst.get("putCall", "")).upper() == "CALL"):
+            tkr = str(inst.get("underlyingSymbol", "")).upper()
+            if not tkr:
+                continue
+            rec = out.setdefault(tkr, {"shares": 0.0, "short_calls": 0})
+            rec["short_calls"] += int(float(p.get("shortQuantity", 0) or 0))
+    return out
+
+
+def open_option_positions(client, account_hash: str | None = None
+                          ) -> list[dict]:
+    """Every option leg held in the account, one entry per leg — the source for
+    the Roll tab. ONE positions fetch. Read-only; [] on any failure.
+
+    Direction-agnostic on purpose (both short and long legs) so future
+    long-option rolling reuses it without a rewrite. Each entry:
+
+      underlying, option_type ("C"/"P"), strike, expiration (YYYY-MM-DD),
+      quantity (int > 0), direction ("short"/"long"), avg_price (open
+      premium/share), market_value, shares_held (of the underlying), and —
+      for calls — covered (short call backed by 100+ shares/contract).
+    """
+    positions = _account_positions(client, account_hash)
+    if not positions:
+        return []
+    # Shares held per underlying first, so a short call can be judged covered.
+    shares_by_tkr: dict[str, float] = {}
+    for p in positions:
+        inst = p.get("instrument", {}) or {}
+        if str(inst.get("assetType", "")).upper() == "EQUITY":
+            tkr = str(inst.get("symbol", "")).upper()
+            if tkr:
+                shares_by_tkr[tkr] = (shares_by_tkr.get(tkr, 0.0)
+                                      + float(p.get("longQuantity", 0) or 0))
+    legs: list[dict] = []
+    for p in positions:
+        inst = p.get("instrument", {}) or {}
+        if str(inst.get("assetType", "")).upper() != "OPTION":
+            continue
+        parsed = _parse_option_symbol(inst.get("symbol", ""))
+        if parsed is None:
+            continue
+        root, exp_iso, opt_type, strike = parsed
+        short_q = int(float(p.get("shortQuantity", 0) or 0))
+        long_q = int(float(p.get("longQuantity", 0) or 0))
+        if short_q > 0:
+            direction, qty = "short", short_q
+        elif long_q > 0:
+            direction, qty = "long", long_q
+        else:
+            continue
+        underlying = str(inst.get("underlyingSymbol", "")).upper() or root
+        shares_held = shares_by_tkr.get(underlying, 0.0)
+        entry = {
+            "underlying": underlying,
+            "option_type": opt_type,
+            "strike": strike,
+            "expiration": exp_iso,
+            "quantity": qty,
+            "direction": direction,
+            "avg_price": float(p.get("averagePrice", 0) or 0),
+            "market_value": float(p.get("marketValue", 0) or 0),
+            "shares_held": shares_held,
+        }
+        if opt_type == "C":
+            entry["covered"] = (direction == "short"
+                                and shares_held >= 100 * qty)
+        legs.append(entry)
+    return legs
+
+
+def rollable_positions(client, account_hash: str | None = None) -> list[dict]:
+    """Short covered calls + short puts held in the account — the Roll tab's
+    list — ONE entry per strike/expiration leg. A thin filter over
+    `open_option_positions`; the general reader stays reusable for future
+    long-option rolling. Read-only; [] on any failure.
+
+    A short call is included when the underlying is share-backed (>= 100 shares
+    — a covered-call program). We deliberately do NOT require every contract to
+    be individually covered: a ticker's several call legs share one share pool,
+    and each open leg must still be listed so the user can roll it. (The strict
+    per-leg `covered` flag double-counts that pool, so it must not gate the
+    list.) Truly naked calls — no shares of the underlying — are excluded. All
+    short puts are included (treated as cash-secured).
+    """
+    out = []
+    for leg in open_option_positions(client, account_hash):
+        if leg["direction"] != "short":
+            continue
+        if leg["option_type"] == "C" and float(leg.get("shares_held", 0)) < 100:
+            continue
+        out.append(leg)
+    return out
+
+
 def held_shares_and_short_calls(client, ticker: str,
                                 account_hash: str | None = None
                                 ) -> tuple[float, int]:
@@ -245,28 +408,9 @@ def held_shares_and_short_calls(client, ticker: str,
     Read-only; returns (0.0, 0) on any failure so the UI degrades to "no
     coverage" rather than erroring.
     """
-    try:
-        from schwab.client import Client
-        if account_hash is None:
-            account_hash = client.get_account_numbers().json()[0]["hashValue"]
-        acct = (client.get_account(
-            account_hash, fields=Client.Account.Fields.POSITIONS)
-            .json().get("securitiesAccount", {}))
-        shares = 0.0
-        short_calls = 0
-        tkr = str(ticker).upper()
-        for p in acct.get("positions", []) or []:
-            inst = p.get("instrument", {}) or {}
-            atype = str(inst.get("assetType", "")).upper()
-            if atype == "EQUITY" and str(inst.get("symbol", "")).upper() == tkr:
-                shares += float(p.get("longQuantity", 0) or 0)
-            elif (atype == "OPTION"
-                  and str(inst.get("putCall", "")).upper() == "CALL"
-                  and str(inst.get("underlyingSymbol", "")).upper() == tkr):
-                short_calls += int(float(p.get("shortQuantity", 0) or 0))
-        return shares, short_calls
-    except Exception:
-        return 0.0, 0
+    rec = held_shares_and_short_calls_map(client, account_hash).get(
+        str(ticker).upper(), {})
+    return float(rec.get("shares", 0.0)), int(rec.get("short_calls", 0))
 
 
 # ── Order building (validation only — placement is a later, separate step) ───
@@ -501,6 +645,115 @@ place_put_sell_order = place_option_sell_order
 place_put_close_order = place_option_close_order
 
 
+# ── Rolls (atomic buy-to-close + sell-to-open, one net-price order) ──────────
+
+@dataclass
+class RollOrder:
+    """A roll: buy-to-close a held short option and sell-to-open a new one on
+    the same underlying + right, submitted as ONE net-price order so both legs
+    fill together (no leg-in risk).
+
+    ``net_limit`` is the per-share net price, SIGNED: positive = a net credit
+    (you collect), negative = a net debit (you pay). Building never places
+    anything; ``place_roll_order`` performs the LIVE submission, and only after
+    the user's explicit confirm.
+    """
+
+    ticker: str
+    option_type: str  # "P" or "C" — same right on both legs
+    close_strike: float
+    close_expiration: str  # YYYY-MM-DD (the held leg)
+    open_strike: float
+    open_expiration: str   # YYYY-MM-DD (the new leg)
+    quantity: int
+    net_limit: float       # per-share net; + = credit, - = debit
+
+    @property
+    def is_credit(self) -> bool:
+        """True when the roll collects premium net (a net-credit roll)."""
+        return self.net_limit >= 0
+
+    @property
+    def net_amount(self) -> float:
+        """Total net cash if filled at ``net_limit`` — signed (+ = received)."""
+        return round(self.net_limit * 100 * self.quantity, 2)
+
+    def describe(self) -> str:
+        ce = datetime.strptime(self.close_expiration,
+                               "%Y-%m-%d").strftime("%b %d '%y")
+        oe = datetime.strptime(self.open_expiration,
+                               "%Y-%m-%d").strftime("%b %d '%y")
+        word = "CALL" if self.option_type == "C" else "PUT"
+        kind = "credit" if self.is_credit else "debit"
+        return (f"ROLL {self.quantity} {self.ticker} {word} "
+                f"${self.close_strike:g} {ce} → ${self.open_strike:g} {oe} "
+                f"@ ${abs(self.net_limit):.2f} net {kind}")
+
+
+def build_roll_order(*, ticker: str, option_type: str,
+                     close_strike: float, close_expiration: str,
+                     open_strike: float, open_expiration: str,
+                     quantity: int, net_limit: float) -> RollOrder:
+    """Validate and return a ``RollOrder`` (no placement).
+
+    Both legs must share the underlying (implicit — one ``ticker``) and the
+    right, quantity ≥ 1, both strikes > 0, and the target leg must differ from
+    the held one (else it isn't a roll). Raises ``ValueError`` on any
+    violation. Mirrors ``build_option_sell_order``.
+    """
+    if option_type not in ("P", "C"):
+        raise ValueError("option_type must be 'P' or 'C'")
+    if int(quantity) < 1:
+        raise ValueError("quantity must be at least 1 contract")
+    if float(close_strike) <= 0 or float(open_strike) <= 0:
+        raise ValueError("strikes must be positive")
+    if (float(close_strike) == float(open_strike)
+            and str(close_expiration) == str(open_expiration)):
+        raise ValueError("roll target must differ from the current leg")
+    return RollOrder(
+        ticker=str(ticker), option_type=option_type,
+        close_strike=float(close_strike),
+        close_expiration=str(close_expiration),
+        open_strike=float(open_strike), open_expiration=str(open_expiration),
+        quantity=int(quantity), net_limit=float(net_limit))
+
+
+def place_roll_order(client, roll: RollOrder, account_hash: str) -> dict:
+    """Submit a roll as ONE two-leg net-price order. LIVE.
+
+    Only ever called after the user's explicit confirm. Builds a single order
+    with a BUY_TO_CLOSE leg (the held option) and a SELL_TO_OPEN leg (the new
+    option), priced NET_CREDIT / NET_DEBIT per ``roll.net_limit``'s sign so both
+    legs execute together. Returns {"ok", "order_id", "error"}.
+    """
+    if (roll.quantity < 1 or roll.close_strike <= 0 or roll.open_strike <= 0):
+        return {"ok": False, "order_id": None, "error": "invalid order"}
+    try:
+        from schwab.orders.generic import OrderBuilder
+        from schwab.orders.common import (
+            Duration, OptionInstruction, OrderStrategyType, OrderType, Session,
+        )
+        close_sym = _osi(roll.ticker, roll.close_strike, roll.close_expiration,
+                         roll.option_type)
+        open_sym = _osi(roll.ticker, roll.open_strike, roll.open_expiration,
+                        roll.option_type)
+        order_type = (OrderType.NET_CREDIT if roll.is_credit
+                      else OrderType.NET_DEBIT)
+        spec = (OrderBuilder()
+                .set_session(Session.NORMAL)
+                .set_duration(Duration.DAY)
+                .set_order_type(order_type)
+                .set_order_strategy_type(OrderStrategyType.SINGLE)
+                .set_price(f"{abs(roll.net_limit):.2f}")
+                .add_option_leg(OptionInstruction.BUY_TO_CLOSE, close_sym,
+                                int(roll.quantity))
+                .add_option_leg(OptionInstruction.SELL_TO_OPEN, open_sym,
+                                int(roll.quantity)))
+    except Exception as exc:  # noqa: BLE001 — bad date / build failure
+        return {"ok": False, "order_id": None, "error": str(exc)}
+    return _submit_spec(client, account_hash, spec)
+
+
 # Order statuses where a cancel still makes sense (not yet terminal).
 CANCELLABLE_STATUSES = frozenset({
     "WORKING", "QUEUED", "ACCEPTED", "NEW", "PENDING_ACTIVATION",
@@ -605,22 +858,28 @@ def cancel_order(client, order_id, last4: str | None = None) -> dict:
 
 # ── Live re-quote (read-only) ────────────────────────────────────────────────
 
-def requote_put(client, ticker: str, expiration: str,
-                strike: float) -> dict | None:
-    """Fresh bid/ask/mid/last for one put via the existing chain fetch.
+def requote_option(client, ticker: str, expiration: str, strike: float,
+                   option_type: str = "P") -> dict | None:
+    """Fresh bid/ask/mid/last for one option leg via the existing chain fetch.
 
-    Read-only; reuses ``schwab_live.fetch_option_chain_schwab``. Returns
-    {bid, ask, mid, last, volume, open_interest, iv, delta} or None when
-    unavailable (iv as a fraction; iv/delta are None when Schwab omits them).
+    ``option_type`` ("P"/"C", or put/call) picks the calls or puts table — a
+    covered call must re-quote the CALL, not the put at the same strike. Read-
+    only; reuses ``schwab_live.fetch_option_chain_schwab``. Returns {bid, ask,
+    mid, last, volume, open_interest, iv, delta} or None when unavailable (iv as
+    a fraction; iv/delta are None when Schwab omits them).
     """
     from stocks_shared.schwab_live import fetch_option_chain_schwab
     try:
         chain = fetch_option_chain_schwab(client, ticker, expiration)
     except Exception:
         return None
-    if chain is None or chain.puts.empty:
+    if chain is None:
         return None
-    row = chain.puts[chain.puts["strike"] == float(strike)]
+    is_call = str(option_type).upper() in ("C", "CALL")
+    table = chain.calls if is_call else chain.puts
+    if table is None or table.empty:
+        return None
+    row = table[table["strike"] == float(strike)]
     if row.empty:
         return None
     r = row.iloc[0]
@@ -635,6 +894,12 @@ def requote_put(client, ticker: str, expiration: str,
             "open_interest": int(r.get("openInterest", 0) or 0),
             "iv": (_vol_pct / 100.0) if _vol_pct else None,
             "delta": _delta if _delta else None}
+
+
+def requote_put(client, ticker: str, expiration: str,
+                strike: float) -> dict | None:
+    """Back-compat alias — re-quote a put. See ``requote_option``."""
+    return requote_option(client, ticker, expiration, strike, option_type="P")
 
 
 # Rate for the implied-vol/delta back-out below. Delta is only weakly

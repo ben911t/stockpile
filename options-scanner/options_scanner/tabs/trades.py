@@ -50,17 +50,85 @@ def _kv_table_html(rows: "list[tuple[str, str]]") -> str:
             f"{cells}</table>")
 
 
+def _day_chart(series: "list | None"):
+    """A small, minimal intraday line for the trade's ticker — green up / red
+    down on the session, with a faint dashed line at the open. Returns an Altair
+    chart, or None when there's too little data to draw.
+
+    `series` is a list of (unix_seconds, close), oldest first (see `_intraday`).
+    """
+    if not series or len(series) < 2:
+        return None
+    import altair as alt
+    import pandas as pd
+    from datetime import datetime, timezone
+
+    df = pd.DataFrame({
+        "t": [datetime.fromtimestamp(ts, tz=timezone.utc) for ts, _ in series],
+        "price": [px for _, px in series],
+    })
+    open_px, last_px = series[0][1], series[-1][1]
+    color = "#16a34a" if last_px >= open_px else "#dc2626"
+    line = alt.Chart(df).mark_line(color=color, strokeWidth=1.7).encode(
+        x=alt.X("t:T", axis=None),
+        y=alt.Y("price:Q", scale=alt.Scale(zero=False),
+                axis=alt.Axis(title=None, labelFontSize=9, tickCount=3,
+                              grid=False, domain=False, ticks=False)),
+        tooltip=[alt.Tooltip("t:T", title="Time", format="%H:%M"),
+                 alt.Tooltip("price:Q", title="Price", format="$.2f")],
+    )
+    open_rule = alt.Chart(pd.DataFrame({"y": [open_px]})).mark_rule(
+        color="#9ca3af", strokeDash=[3, 3], size=1).encode(y="y:Q")
+    # usermeta.embedOptions.actions=False strips the vega "⋮" menu (Save/View
+    # Source/Compiled Vega) — it only dumps raw JSON with no way back, and this
+    # sparkline has nothing to export.
+    return ((open_rule + line)
+            .properties(height=104,
+                        usermeta={"embedOptions": {"actions": False}})
+            .configure_view(strokeWidth=0))
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _close_quote(app_key: str, app_secret: str, callback_url: str,
                  token_file: str, ticker: str, expiration: str,
-                 strike: float) -> dict | None:
-    """Cached (30s) read-only re-quote for one put. Returns dict or None."""
+                 strike: float, option_type: str = "P") -> dict | None:
+    """Cached (30s) read-only re-quote for one option leg (put or call, per
+    `option_type`). Returns dict or None."""
     from stocks_shared.schwab_live import get_client
     try:
         client = get_client(app_key, app_secret, callback_url, token_file)
     except Exception:
         return None
-    return trade_actions.requote_put(client, ticker, expiration, strike)
+    return trade_actions.requote_option(client, ticker, expiration, strike,
+                                        option_type=option_type)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _intraday(app_key: str, app_secret: str, callback_url: str,
+              token_file: str, ticker: str) -> "list | None":
+    """Cached (60s) intraday closes for the ticker's most recent session →
+    [(unix_seconds, close), …] oldest first, or None when unavailable.
+
+    Schwab 5-minute bars, filtered to the last session present so it reads as
+    'today' while the market is open (and the prior close otherwise). Feeds the
+    Trades tab's small day chart."""
+    from stocks_shared.schwab_live import get_client, fetch_price_history_schwab
+    try:
+        client = get_client(app_key, app_secret, callback_url, token_file)
+        bars = fetch_price_history_schwab(client, ticker, "5m", limit=500)
+    except Exception:
+        return None
+    if not bars:
+        return None
+    from datetime import datetime, timezone
+
+    def _localdate(ts):
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().date()
+
+    last_day = _localdate(bars[-1]["time"])
+    series = [(b["time"], float(b["close"])) for b in bars
+              if b.get("close") and _localdate(b["time"]) == last_day]
+    return series or None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -247,9 +315,10 @@ def _cancel_close_order(scfg: dict, trade: dict) -> dict:
 
 @st.fragment
 def tab_trades() -> None:
-    # A fragment so Cancel / Remove / close actions rerun only this tab, not
-    # the whole app — otherwise the full rerun re-runs run_app's st.tabs and
-    # snaps the view back to the first tab.
+    # A fragment so widget edits rerun just this tab. Explicit Cancel / Remove /
+    # close actions call a full st.rerun() — never scope="fragment", which is
+    # illegal during a full script run — and that's safe now because run_app's
+    # tab selector preserves the active tab across a full rerun (no snap to tab 0).
     provider = st.session_state.get("data_source", "yahoo")
     scfg = st.session_state.get("schwab_config") or {}
     # Current order mode (config `paper` flag) as a badge beside the Trades
@@ -269,7 +338,9 @@ def tab_trades() -> None:
                                 scfg.get("token_file", ""))
                    if (provider == "schwab" and scfg.get("app_key")) else None)
 
-    trades = trades_store.load()
+    # "rolling" trades are in-flight net-price rolls managed on the Roll tab —
+    # they surface here as normal open positions only once they fill.
+    trades = [t for t in trades_store.load() if t.get("status") != "rolling"]
     if not trades:
         section_header(title=f"Trades{_mode_badge}")
         st.info(
@@ -323,6 +394,7 @@ def tab_trades() -> None:
     status_by_id: dict = {}
     close_status_by_id: dict = {}
     quote_by_id: dict = {}
+    chart_by_ticker: dict = {}   # ticker -> intraday series for the day chart
     if provider == "schwab" and scfg.get("app_key"):
         _ak, _as = scfg.get("app_key", ""), scfg.get("app_secret", "")
         _cb, _tf = scfg.get("callback_url", ""), scfg.get("token_file", "")
@@ -338,9 +410,14 @@ def tab_trades() -> None:
         def _quote_job(tr):
             return _close_quote(_ak, _as, _cb, _tf, tr.get("ticker"),
                                 tr.get("expiration", ""),
-                                float(tr.get("strike", 0)))
+                                float(tr.get("strike", 0)),
+                                tr.get("option_type", "P"))
 
-        jobs = []  # (kind, trade_id, trade)
+        def _chart_job(tr):
+            return _intraday(_ak, _as, _cb, _tf, tr.get("ticker"))
+
+        jobs = []  # (kind, key, trade) — key is trade_id, or ticker for charts
+        _chart_seen = set()
         for tr in trades:
             # Opening-order status only matters while the trade is still open;
             # a working closing order is polled via close_order_id instead.
@@ -351,6 +428,11 @@ def tab_trades() -> None:
                     and tr.get("status") == "closing"):
                 jobs.append(("close_status", tr.get("id"), tr))
             jobs.append(("quote", tr.get("id"), tr))
+            # One intraday fetch per unique ticker (keyed by ticker, deduped).
+            _ctk = tr.get("ticker")
+            if _ctk and _ctk not in _chart_seen:
+                _chart_seen.add(_ctk)
+                jobs.append(("chart", _ctk, tr))
 
         if jobs:
             # Attach this run's context to the worker threads so the cached
@@ -362,10 +444,12 @@ def tab_trades() -> None:
                 max_workers=min(8, len(jobs)), initializer=_init)
             _job_fns = {"status": _status_job,
                         "close_status": _close_status_job,
-                        "quote": _quote_job}
+                        "quote": _quote_job,
+                        "chart": _chart_job}
             _job_maps = {"status": status_by_id,
                          "close_status": close_status_by_id,
-                         "quote": quote_by_id}
+                         "quote": quote_by_id,
+                         "chart": chart_by_ticker}
             fut_map = {}
             for kind, tid, tr in jobs:
                 fut_map[ex.submit(_job_fns[kind], tr)] = (kind, tid)
@@ -441,23 +525,28 @@ def tab_trades() -> None:
             _has_snapshot = bool(q and t.get("status") in ("open", "closing"))
             if _has_snapshot:
                 _strike = float(t.get("strike", 0))
+                _is_call = t.get("option_type") == "C"
                 try:
                     _dte = (datetime.strptime(exp, "%Y-%m-%d").date()
                             - datetime.now().date()).days
                 except Exception:
                     _dte = None
                 _iv, _delta = q.get("iv"), q.get("delta")
-                _ann = (q["mid"] / _strike * (365.0 / _dte) * 100.0
-                        if (_dte and _dte > 0 and _strike and q.get("mid"))
-                        else None)
                 # Underlying spot + day-change % (one cached fetch_spot_meta
-                # call) for the Spot row under Vol.
+                # call) for the Spot row under Vol — and the Ann% base for a call.
                 from options_scanner.display.spot_meta import fetch_spot_meta
                 try:
                     _meta = fetch_spot_meta(str(t.get("ticker", "")), provider)
                 except Exception:
                     _meta = {}
                 _spot, _spct = _meta.get("spot"), _meta.get("pct_change")
+                # Annualized yield: a covered call is measured against spot (the
+                # shares are the capital); a cash-secured put against its strike
+                # (the cash collateral). Mirrors the scanner's Ann% convention.
+                _ann_base = _spot if _is_call else _strike
+                _ann = (q["mid"] / _ann_base * (365.0 / _dte) * 100.0
+                        if (_dte and _dte > 0 and _ann_base and q.get("mid"))
+                        else None)
 
                 # Delta cell: live value, plus the fill-time delta once captured.
                 _delta_cell = f"{_delta:.2f}" if _delta is not None else "—"
@@ -465,11 +554,11 @@ def tab_trades() -> None:
                     _delta_cell += ("<span style='color:#94a3b8'> · fill "
                                     f"{float(t['fill_delta']):.2f}</span>")
                 # DTE cell: days remaining, plus how long the position has been
-                # open once we know when it opened (mirrors the fill
-                # annotations on Delta/Spot).
+                # open — but only once it's a real (filled) position. A working
+                # opening order isn't open yet, so don't tack "open 0d" onto it.
                 _dte_cell = str(_dte) if _dte is not None else "—"
                 _opened = t.get("opened_at")
-                if _opened:
+                if _opened and not _pending_open:
                     try:
                         _days_open = (datetime.now()
                                       - datetime.fromisoformat(_opened)).days
@@ -478,7 +567,8 @@ def tab_trades() -> None:
                     except Exception:
                         pass
                 _terms = [
-                    ("Type", "Put"), ("Strike", f"${_strike:g}"),
+                    ("Type", "Call" if _is_call else "Put"),
+                    ("Strike", f"${_strike:g}"),
                     ("Expir", exp_disp),
                     ("DTE", _dte_cell),
                     ("IV", f"{_iv * 100:.1f}%" if _iv else "—"),
@@ -506,27 +596,37 @@ def tab_trades() -> None:
                 ]
 
             def _render_cards(cols):
+                # A closed position shows the REALIZED close/P&L recorded at the
+                # fill (`close_cost`), NOT the live re-quote mid — the position
+                # is gone, and its mid keeps drifting with the market. An open
+                # position uses the live mid as a cost-to-close estimate.
+                _closed = t.get("status") in ("closed", "expired", "assigned")
+                _cc = t.get("close_cost")
+                _cost_ps = (float(_cc) if _cc is not None else None) if _closed \
+                    else close_mid
+                _cost_label = "CLOSE COST" if _closed else "COST TO CLOSE"
+                _pl_kind = "REALIZED P/L" if _closed else "UNREALIZED P/L"
                 with cols[0]:
                     metric_card("CREDIT RECEIVED", f"${total_credit:,.0f}",
                                 delta=f"${credit_ps:.2f}/sh", delta_sign="neutral")
                 with cols[1]:
-                    if close_mid is not None:
-                        metric_card("COST TO CLOSE",
-                                    f"${close_mid * 100 * qty:,.0f}",
-                                    delta=f"${close_mid:.2f}/sh",
+                    if _cost_ps is not None:
+                        metric_card(_cost_label,
+                                    f"${_cost_ps * 100 * qty:,.0f}",
+                                    delta=f"${_cost_ps:.2f}/sh",
                                     delta_sign="neutral")
                     else:
-                        metric_card("COST TO CLOSE", "—",
+                        metric_card(_cost_label, "—",
                                     delta="re-quote unavailable",
                                     delta_sign="neutral")
                 with cols[2]:
-                    if close_mid is not None:
-                        _close_cost = close_mid * 100 * qty
+                    if _cost_ps is not None:
+                        _close_cost = _cost_ps * 100 * qty
                         pnl = total_credit - _close_cost
                         # Formula on a small line just above the value: credit
-                        # received − cost to close (both at the mid).
+                        # received − close cost.
                         _pl_label = (
-                            "UNREALIZED P/L<br><span style='font-weight:400;"
+                            f"{_pl_kind}<br><span style='font-weight:400;"
                             "text-transform:none;letter-spacing:0;"
                             "font-size:0.8em;color:#94a3b8;'>"
                             f"${total_credit:,.0f} − ${_close_cost:,.0f}</span>")
@@ -538,7 +638,7 @@ def tab_trades() -> None:
                             _pl_label,
                             f"<span style='color:{_pl_color}'>{_pl_num}</span>")
                     else:
-                        metric_card("UNREALIZED P/L", "—")
+                        metric_card(_pl_kind, "—")
                 with cols[3]:
                     metric_card("STATUS", _disp_status.upper())
 
@@ -550,18 +650,74 @@ def tab_trades() -> None:
                 # trade, where STATUS sits under COST TO CLOSE; cols[2]
                 # (bottom-left) is left empty.
                 _strike_v = float(t.get("strike", 0))
+                _call = t.get("option_type") == "C"
                 with cols[0]:
                     metric_card("CREDIT IF FILLED", f"${total_credit:,.0f}",
                                 delta=f"${credit_ps:.2f}/sh", delta_sign="neutral")
                 with cols[1]:
-                    metric_card("COLLATERAL", f"${_strike_v * 100 * qty:,.0f}",
-                                delta=f"${_strike_v:g} × 100 × {qty}",
-                                delta_sign="neutral")
+                    if _call:
+                        # A covered call is collateralized by shares, not cash —
+                        # 100 shares per contract must be held to cover it.
+                        metric_card("SHARES TO COVER", f"{100 * qty:,}",
+                                    delta=f"100 × {qty} shares",
+                                    delta_sign="neutral")
+                    else:
+                        metric_card("COLLATERAL", f"${_strike_v * 100 * qty:,.0f}",
+                                    delta=f"${_strike_v:g} × 100 × {qty}",
+                                    delta_sign="neutral")
                 with cols[3]:
                     metric_card("STATUS", _disp_status.upper())
 
-            # Open position: details (two columns) left, cards as a 2x2 grid
-            # right. No snapshot (closed/canceled): cards span full width. A
+            # Close-mode flags (pure from the trade + config), hoisted so the
+            # broker-status line and close disclaimer can render up in the
+            # details column while the close controls below reuse them.
+            trade_live = not bool(t.get("paper"))
+            config_paper = bool(scfg.get("paper", True))
+            close_live = trade_live and not config_paper
+            _live_in_paper = trade_live and config_paper
+
+            # Broker-order status + close-mode disclaimer, as closures so the
+            # snapshot layout (below the contract details, left of the chart)
+            # and the no-snapshot layout share one definition.
+            def _broker_status_line():
+                if bs is None:
+                    return
+                if filled:
+                    _fn, _qn = bs.get("filled"), bs.get("quantity")
+                    _frac = (f" ({int(_fn)} of {int(_qn)} contracts)"
+                             if _fn is not None and _qn is not None else "")
+                    _fat = bs.get("filled_at")
+                    _when = f" on {_fat:%b %d, %Y %I:%M %p}" if _fat else ""
+                    st.caption(f"✅ Broker order **FILLED**{_frac}{_when}.")
+                elif working:
+                    st.caption(f"⏳ Broker order **{bs['status']}** — not yet "
+                               "filled; the P/L above applies once it fills. "
+                               "Cancel below, or wait for a fill.")
+                else:
+                    st.caption(f"Broker order: **{bs['status']}**.")
+
+            def _close_disclaimer_line():
+                if not (t.get("status") == "open" and filled):
+                    return
+                if _live_in_paper:
+                    st.warning(
+                        "⚠️ This is a **real (live)** position, but the app is "
+                        "in **paper mode** (`paper = true`). Paper mode can't "
+                        "send — or simulate — a closing order for a live "
+                        "position (that would desync the tracker from your open "
+                        "broker position). Set `paper = false` in config.toml "
+                        "and restart to manage it.")
+                else:
+                    st.caption("🔴 LIVE close — sends a real buy-to-close order."
+                               if close_live else
+                               "📝 Records the close in the tracker; no live "
+                               "order.")
+                if close_live and market_open is False:
+                    st.caption("⏸ Market closed")
+
+            # Open position: details (two columns) + status/disclaimer left,
+            # cards as a 2x2 grid + day chart right. No snapshot (closed/
+            # canceled): cards span full width, status/disclaimer inline below. A
             # working opening order uses the same grid/row, just with order-
             # pending cards (3 of the 4 cells filled — P/L doesn't apply yet).
             _card_fn = _render_pending_cards if _pending_open else _render_cards
@@ -575,12 +731,31 @@ def tab_trades() -> None:
                     with _s2:
                         st.markdown(_kv_table_html(_prices),
                                     unsafe_allow_html=True)
+                    # Broker status + close disclaimer, below the contract
+                    # details (to the left of the day chart).
+                    _broker_status_line()
+                    _close_disclaimer_line()
                 with _cards_col:
                     _row1 = st.columns(2)
                     _row2 = st.columns(2)
                     _card_fn([_row1[0], _row1[1], _row2[0], _row2[1]])
+                    # Day chart of the underlying, below the cards and spanning
+                    # the right column (just under UNREALIZED P/L / STATUS).
+                    _chart = _day_chart(chart_by_ticker.get(t.get("ticker")))
+                    _box = st.container(border=True)
+                    _box.markdown(
+                        "<div style='font-size:0.62rem;font-weight:700;"
+                        "letter-spacing:0.09em;color:#94a3b8;"
+                        f"text-transform:uppercase;'>Today · {t.get('ticker', '')}"
+                        "</div>", unsafe_allow_html=True)
+                    if _chart is not None:
+                        _box.altair_chart(_chart, use_container_width=True)
+                    else:
+                        _box.caption("Intraday chart unavailable.")
             else:
                 _card_fn(st.columns(4))
+                _broker_status_line()
+                _close_disclaimer_line()
 
             # Closing order in flight: a live buy-to-close is working. Keep
             # tracking the position — poll the close order, offer Cancel, and
@@ -604,7 +779,7 @@ def tab_trades() -> None:
                                 (_cat.isoformat() if _cat
                                  else datetime.now().isoformat(
                                      timespec="seconds")))
-                    st.rerun(scope="fragment")
+                    st.rerun()
                 _cstat = cbs.get("status") if cbs else None
                 _close_working = bool(cbs and cbs.get("cancelable"))
                 # Terminal but not FILLED → the buy-to-close never (fully)
@@ -640,7 +815,7 @@ def tab_trades() -> None:
                     st.session_state[f"close_note_{t['id']}"] = _note
                     st.session_state.pop(f"close_result_{t['id']}", None)
                     _order_status.clear()
-                    st.rerun(scope="fragment")
+                    st.rerun()
 
                 if _cstat:
                     st.caption(f"⏳ Closing order **{_cstat}**{_qty_txt}{_lim_txt}"
@@ -667,7 +842,7 @@ def tab_trades() -> None:
                         # reverted-to-open close panel doesn't resurface it.
                         st.session_state.pop(f"close_result_{t['id']}", None)
                         _order_status.clear()
-                        st.rerun(scope="fragment")
+                        st.rerun()
                 with _xc2:
                     _rmbox = st.container(key=f"rm_box_{t['id']}")
                     _rmbox.button("Remove from Tracker", key=f"rm_{t['id']}",
@@ -679,24 +854,8 @@ def tab_trades() -> None:
                         _ccres["msg"].replace("$", "\\$"))
                 continue
 
-            # Broker order status (`bs`) was fetched above for the title;
-            # working / filled / is_paper were derived from it near the top.
-            if bs is not None:
-                if filled:
-                    # filledQuantity / quantity = contracts filled of ordered
-                    # (Schwab returns them as floats).
-                    _fn, _qn = bs.get("filled"), bs.get("quantity")
-                    _frac = (f" ({int(_fn)} of {int(_qn)} contracts)"
-                             if _fn is not None and _qn is not None else "")
-                    _fat = bs.get("filled_at")
-                    _when = f" on {_fat:%b %d, %Y %I:%M %p}" if _fat else ""
-                    st.caption(f"✅ Broker order **FILLED**{_frac}{_when}.")
-                elif working:
-                    st.caption(f"⏳ Broker order **{bs['status']}** — not yet "
-                               "filled; the P/L above applies once it fills. "
-                               "Cancel below, or wait for a fill.")
-                else:
-                    st.caption(f"Broker order: **{bs['status']}**.")
+            # Broker-order status now renders up in the details column (see
+            # _broker_status_line, above the card layout).
 
             # While unfilled → Cancel (a live working order, or a paper sim that
             # never reaches a broker). Place Closing Trade appears only once the
@@ -727,7 +886,7 @@ def tab_trades() -> None:
                             st.session_state[_crk] = {
                                 "ok": True, "msg": "Paper trade canceled."}
                         # Re-run the fragment so the status reflects it now.
-                        st.rerun(scope="fragment")
+                        st.rerun()
                 with _ac2:
                     _rmbox = st.container(key=f"rm_box_{t['id']}")
                     _rmbox.button("Remove from Tracker", key=f"rm_{t['id']}",
@@ -759,38 +918,13 @@ def tab_trades() -> None:
                 _confirm_key = f"close_confirm_{t['id']}"
                 _result_key = f"close_result_{t['id']}"
                 _result = st.session_state.get(_result_key)
-                # A live position must be closed with a live order; a paper
-                # trade is closed in the tracker only. Live closing obeys the
-                # same config paper-arm switch + market-hours gate as opening.
-                trade_live = not bool(t.get("paper"))
-                config_paper = bool(scfg.get("paper", True))
-                close_live = trade_live and not config_paper
-                # A real (live) position viewed while the app is in paper mode:
-                # it can't be paper-closed (that would mark a still-open broker
-                # position "closed" in the tracker), so flag it and block below.
-                _live_in_paper = trade_live and config_paper
                 # Badge reflects what the close would do; a live position in
-                # paper mode is LIVE (and blocked), never "paper".
+                # paper mode is LIVE (and blocked), never "paper". The close-mode
+                # flags are hoisted above the card, and the mode/market-gate
+                # disclaimer renders up in the details column
+                # (_close_disclaimer_line).
                 _close_badge = ("🔴 LIVE" if (close_live or _live_in_paper)
                                 else "📝 PAPER")
-
-                # Mode + market gate ABOVE the button so they clearly describe
-                # the close (not the Remove button that follows below).
-                if _live_in_paper:
-                    st.warning(
-                        "⚠️ This is a **real (live)** position, but the app is "
-                        "in **paper mode** (`paper = true`). Paper mode can't "
-                        "send — or simulate — a closing order for a live "
-                        "position (that would desync the tracker from your open "
-                        "broker position). Set `paper = false` in config.toml "
-                        "and restart to manage it.")
-                else:
-                    st.caption("🔴 LIVE close — sends a real buy-to-close order."
-                               if close_live else
-                               "📝 Records the close in the tracker; no live "
-                               "order.")
-                if close_live and market_open is False:
-                    st.caption("⏸ Market closed")
 
                 # Inputs row: close limit + how many contracts to buy back —
                 # always shown (locked at 1 for a single-lot) so the count is
@@ -897,7 +1031,7 @@ def tab_trades() -> None:
                         # re-renders with the working-status + Cancel UI instead
                         # of the (now stale) close panel.
                         if _result.get("ok") and close_live:
-                            st.rerun(scope="fragment")
+                            st.rerun()
 
                 if _result:
                     (st.success if _result.get("ok") else st.error)(

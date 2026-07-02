@@ -36,10 +36,14 @@ uv run streamlit run options-scanner/run_app.py
 ```
 
 Opens at `http://localhost:8501` with tabs for Single Ticker, Watchlist,
-Portfolio, GEX, Spreads/Directional/Neutral, and **Live Charts** (the
-trading dashboard, embedded). To launch the scanner **and** the dashboard together
-(so Live Charts is populated), run `uv run run.py` from the repo root
-instead.
+Trades, **Roll**, Portfolio, GEX, Spreads/Directional/Neutral, and
+**Live Charts** (the trading dashboard, embedded). The **Roll** tab is
+the only place that *places* a roll: it reads live short covered
+calls + short puts from your Schwab account and submits a
+buy-to-close + sell-to-open as one atomic net-price order (Schwab only;
+the Portfolio/Single "Roll" views stay analysis-only and point here).
+To launch the scanner **and** the dashboard together (so Live Charts is
+populated), run `uv run run.py` from the repo root instead.
 
 ### Options scanner — CLI (single ticker)
 
