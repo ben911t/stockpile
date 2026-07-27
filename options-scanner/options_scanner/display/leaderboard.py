@@ -19,8 +19,9 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from options_scanner import iv_scores
+from options_scanner import confirm_gate, iv_scores
 from options_scanner.format import EARNINGS_WARN_LEGEND, fmt_strike
+from options_scanner.ui_theme import df_height
 from options_scanner.display.scan_stamp import stamp_caption
 
 
@@ -160,10 +161,12 @@ def _submit_put_order(scfg: dict, order, cap: dict | None,
         if fill:
             rec.update({k: v for k, v in fill.items() if v is not None})
         trades_store.add(rec)
+        # Toast format: headline first, then ONE sentence per line (run_app
+        # renders each following line as its own bullet).
         return {"ok": True,
-                "msg": (f"📝 Paper trade recorded — {order.describe()}. "
-                        "No live order sent. Set `paper = false` in "
-                        "config.toml to submit for real.")}
+                "msg": (f"📝 Paper trade recorded — {order.describe()}\n"
+                        "No live order was sent.\n"
+                        "Set paper = false in config.toml to submit for real.")}
     from stocks_shared.schwab_live import get_client
     try:
         client = get_client(scfg.get("app_key", ""), scfg.get("app_secret", ""),
@@ -184,7 +187,9 @@ def _submit_put_order(scfg: dict, order, cap: dict | None,
                       "account": mask})
     _oid = f" (id {res['order_id']})" if res["order_id"] else ""
     return {"ok": True,
-            "msg": (f"✅ LIVE order sent to {mask}{_oid} — {order.describe()}. "
+            "msg": (f"✅ LIVE order sent to {mask}{_oid}\n"
+                    f"{order.describe()}.\n"
+                    "The order is working until your broker fills it.\n"
                     "Verify at your broker.")}
 
 
@@ -243,6 +248,10 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
     side = c.get("side", "put")
     is_call = side == "call"
     opt_type = "C" if is_call else "P"
+    # Contract-scoped suffix for every session key on this screen (input widgets,
+    # confirm arm, last result). Defined up front because the input widgets below
+    # need it and the confirm gate reads those widgets back by key.
+    _ck = f"{c['ticker']}_{c['strike']:g}_{c['expiration']}"
 
     exp = datetime.strptime(c["expiration"], "%Y-%m-%d").strftime("%b %d '%y")
 
@@ -259,9 +268,16 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         ("DTE", f"{c['dte']}"), ("IV", iv_txt), ("Delta", delta_txt),
         ("Ann%", ann_txt),
     ]
+    # "Last" carries the print time (New York) on its own line beneath the price
+    # when the scan supplied it, so a stale last is obvious while you set the
+    # limit.
+    _last_cell = _money(c.get("last"))
+    _lt = trade_actions.fmt_last_trade_et(c.get("last_trade_ms"))
+    if _lt:
+        _last_cell += f"<br><span style='color:#94a3b8'>{_lt}</span>"
     prices = [
         ("Bid", _money(c.get("bid"))), ("Ask", _money(c.get("ask"))),
-        ("Mid", _money(c.get("mid"))), ("Last", _money(c.get("last"))),
+        ("Mid", _money(c.get("mid"))), ("Last", _last_cell),
         ("OI", f"{c['open_interest']:,d}"), ("Vol", f"{c['volume']:,d}"),
     ]
 
@@ -348,6 +364,13 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         # user can still set their own and place it).
         if assessment.liquid:
             default_limit = assessment.suggested_limit
+            # Same ask cap as the thin branch (rule: a SELL suggestion is never
+            # above the ask). Here it only bites when an off-tick ask lets the
+            # tick-rounded mid land a hair above it — normally a no-op.
+            _ask = c.get("ask")
+            if _ask is not None and _ask == _ask and float(_ask) > 0:  # not NaN
+                default_limit = min(default_limit,
+                                    trade_actions.floor_to_tick(float(_ask)))
             st.markdown("**Suggested limit** — mid, rounded to the tick.")
         else:
             st.warning("**Thin/wide market:** " + "; ".join(assessment.reasons)
@@ -363,13 +386,33 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
             _floor = max((v for v in (c.get("mid"), c.get("last")) if v),
                          default=0.0)
             default_limit = trade_actions.round_to_tick(max(_base, _floor))
-            if model is not None:
-                st.markdown(f"**Suggested \\${default_limit:.2f}** — IV-aligned "
-                            f"(\\${model:.2f}), floored at the higher of "
-                            "mid/last. Override as you like.")
+            # …but never above the current ask. Selling above the best offer
+            # just parks the order behind the whole book, and a rich IV model or
+            # a stale `last` above the ask shouldn't drive the suggestion there.
+            # Cap at the ask, rounded DOWN to a valid tick. Skipped when there's
+            # no real offer (a thin LEAP can quote ask 0 / absent).
+            _ask = c.get("ask")
+            _capped = False
+            if _ask is not None and _ask == _ask and float(_ask) > 0:  # not NaN
+                _ask_cap = trade_actions.floor_to_tick(float(_ask))
+                if _ask_cap < default_limit:
+                    default_limit = _ask_cap
+                    _capped = True
+            # Red (only reachable on a thin/wide market) so the derived —
+            # rather than market-observed — suggestion stands out next to the
+            # warning above it. `:red[…]` is Streamlit's own directive, so it
+            # tracks the active theme instead of a hardcoded hex.
+            if _capped:
+                _why = f" (IV model \\${model:.2f})" if model is not None else ""
+                st.markdown(f":red[**Suggested \\${default_limit:.2f}** — capped "
+                            f"at the ask{_why}. Override as you like.]")
+            elif model is not None:
+                st.markdown(f":red[**Suggested \\${default_limit:.2f}** — "
+                            f"IV-aligned (\\${model:.2f}), floored at the "
+                            "higher of mid/last. Override as you like.]")
             else:
-                st.markdown(f"**Suggested \\${default_limit:.2f}** — mid/last "
-                            "(no IV model). Override as you like.")
+                st.markdown(f":red[**Suggested \\${default_limit:.2f}** — "
+                            "mid/last (no IV model). Override as you like.]")
 
         # Stronger resting border on the two inputs so they clearly read as
         # editable fields. Scoped to the dialog so other number inputs in the
@@ -382,65 +425,112 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
             "</style>",
             unsafe_allow_html=True,
         )
-        lim_col, qty_col = st.columns(2)
+        # Max sizing (shares/cash affordability) now rides IN the Contracts
+        # label — "Contracts (Max N)" — so the sizing caption beside the fields
+        # doesn't have to repeat it. None when unknown → plain "Contracts".
+        # The "  \n" is a markdown hard break so the max drops to its own line
+        # under "Contracts" (keeps the label narrow beside the Limit field).
+        _max_qty = affordable if affordable and affordable >= 1 else None
+        _qty_label = (f"Contracts  \n(Max {_max_qty})" if _max_qty is not None
+                      else "Contracts")
+        # Widget keys hoisted into names: the confirm gate reads these two inputs
+        # from session_state to decide whether Confirm still applies (see
+        # confirm_gate — editing either one disarms Place).
+        _limit_wid = f"investigate_limit_{_ck}"
+        _qty_wid = f"investigate_qty_{_ck}"
+        _val_keys = (_limit_wid, _qty_wid)
+        # Three across on one row: the two inputs plus the sizing note beside
+        # them (bottom-aligned so the note sits level with the fields, not their
+        # labels). The note was a full-width line below; moving it up tightens
+        # the dialog and keeps the max next to the field it constrains.
+        lim_col, qty_col, info_col = st.columns(
+            [1, 1, 2], vertical_alignment="bottom")
+        # NO min_value/max_value on either input, deliberately. Streamlit does
+        # not commit an out-of-range entry: it shows its own "must be ≤ N"
+        # message and keeps serving the last valid value. Typing 5 contracts
+        # against a 4-contract limit therefore left the app holding 1, which is
+        # valid — so the order built, Confirm armed, and Place appeared for a
+        # size the user never asked for. Unbounded widgets hand the typed number
+        # to build_option_sell_order, which rejects it *and says why*.
         with lim_col:
             limit = st.number_input(
-                "Limit price",
-                min_value=float(trade_actions.tick_for(default_limit)),
-                value=float(default_limit),
+                "Limit price", value=float(default_limit),
                 step=float(trade_actions.tick_for(default_limit)), format="%.2f",
-                key=f"investigate_limit_{c['ticker']}_{c['strike']:g}_{c['expiration']}",
+                key=_limit_wid,
             )
         with qty_col:
+            # The cap stays in the label ("Contracts (Max 4)") — advisory now,
+            # enforced by the builder below.
             qty = st.number_input(
-                "Contracts", min_value=1, value=1, step=1,
-                max_value=(affordable if affordable and affordable >= 1 else None),
-                key=f"investigate_qty_{c['ticker']}_{c['strike']:g}_{c['expiration']}",
+                _qty_label, value=1, step=1, key=_qty_wid,
             )
-        if is_call:
-            if cov is not None:
-                _aff = (f" · up to {affordable} covered call"
-                        f"{'s' if (affordable or 0) != 1 else ''}"
-                        if affordable is not None else "")
-                st.caption(
-                    f"Shares held **{cov.get('shares', 0):,.0f}** "
-                    f"({cov.get('short_calls', 0)} already in calls){_aff} "
-                    "(100 shares cover each call).")
+        with info_col:
+            # st.markdown (not st.caption) so the sizing note reads at full
+            # strength — caption's muted gray looked faded. "  \n" hard-breaks
+            # the "See Account…" line onto its own row.
+            if is_call:
+                if cov is not None:
+                    st.markdown(
+                        f"Shares held **{cov.get('shares', 0):,.0f}** "
+                        f"({cov.get('short_calls', 0)} already in calls).  \n"
+                        "100 shares cover each call.")
+                else:
+                    st.markdown("Share coverage unavailable — connect Schwab "
+                                "(Accounts & Trading access required).")
+            elif cap_amt is not None:
+                st.markdown(
+                    f"**Avail Cash: \\${cap_amt:,.0f}**, "
+                    f"(\\${c['strike'] * 100:,.0f} each).  \n"
+                    "See Account info below for full balances.")
             else:
-                st.caption("Share coverage unavailable — connect Schwab "
-                           "(Accounts & Trading access required).")
-        elif cap_amt is not None:
-            _aff = f" · up to {affordable}" if affordable is not None else ""
-            st.caption(f"Cash for puts \\${cap_amt:,.0f}{_aff} "
-                       f"(\\${c['strike'] * 100:,.0f} collateral each). "
-                       "See Account info below for full balances.")
-        else:
-            st.caption("Cash for puts unavailable — connect Schwab "
-                       "(Accounts & Trading access required).")
+                st.markdown("Cash for puts unavailable — connect Schwab "
+                            "(Accounts & Trading access required).")
 
-        # Order preview + validation. `order_ok` gates the Place Trade button.
-        order_ok = False
-        try:
-            order = trade_actions.build_option_sell_order(
+        # Order preview + validation. One builder, called two ways: here with the
+        # values on screen (to draw the preview or the error), and again inside
+        # the Confirm callback with the values as of the click — so Confirm can
+        # stay clickable while an error shows and still refuse to arm a bad size.
+        def _build(limit_v, qty_v):
+            return trade_actions.build_option_sell_order(
                 ticker=c["ticker"], strike=c["strike"],
-                expiration=c["expiration"], limit=float(limit),
-                quantity=int(qty), option_type=opt_type,
+                expiration=c["expiration"], limit=float(limit_v),
+                quantity=int(qty_v), option_type=opt_type,
                 capacity=(None if is_call else cap_amt),
                 max_contracts=(affordable if is_call else None),
             )
+
+        def _order_error(limit_v, qty_v) -> str | None:
+            """User-facing reason this order can't be placed, or None."""
+            if limit_v is None or qty_v is None:
+                # An emptied number box returns None; without this it would reach
+                # the builder as int(None) and raise TypeError, not a message.
+                return "Enter a limit price and a contract count."
+            try:
+                _build(limit_v, qty_v)
+            except (ValueError, TypeError) as exc:
+                return f"Can't build this order: {exc}"
+            return None
+
+        order = None
+        _order_err = _order_error(limit, qty)
+        order_ok = _order_err is None
+        if order_ok:
+            order = _build(limit, qty)
             _req = (f"covers {order.shares_to_cover} shares" if is_call
                     else f"collateral ${order.collateral:,.0f}")
             st.success(
                 (f"{order.describe()} — credit ${order.credit:,.0f}, "
                  f"{_req}.").replace("$", "\\$"))
-            order_ok = True
-        except ValueError as exc:
-            st.error(f"Can't build this order: {exc}")
+        else:
+            st.error(_order_err)
 
     # Session keys scoped to this contract (confirm-pending + last result).
-    _ck = f"{c['ticker']}_{c['strike']:g}_{c['expiration']}"
     _confirm_key = f"place_confirm_{_ck}"
     _result_key = f"place_result_{_ck}"
+    # Is the order armed? Computed BEFORE the Confirm button so Confirm can be
+    # drawn disabled in the same frame Place appears — the two are never both
+    # live. Editing the limit or contracts since Confirm disarms in here.
+    _armed = confirm_gate.armed(_confirm_key, _val_keys, valid=order_ok)
     paper = bool(scfg.get("paper", True))
     # Mode badge on the action buttons so PAPER vs LIVE is unmissable.
     _badge = "📝 PAPER" if paper else "🔴 LIVE"
@@ -460,13 +550,21 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
                        "your broker.")
     with foot_r:
         # Paper records a simulation any time; a LIVE order is market-gated.
-        if not order_ok:
-            st.button(f"Confirm Trade · {_badge}", disabled=True, key=f"place_{_ck}",
-                      help="Fix the order above first.")
+        # NOTE: an invalid order does NOT disable this button — it stays
+        # clickable so a corrected value can be confirmed in one click (the
+        # click commits the number box and the callback re-validates). Only
+        # conditions the user can't fix by editing a field disable it.
+        if _armed:
+            # Armed → Place is showing below. Cancel is the way back, so this
+            # can't be clicked into a second confirm of stale numbers.
+            st.button(f"Confirm Trade · {_badge}", disabled=True,
+                      key=f"place_{_ck}", help=confirm_gate.ARMED_HELP)
         elif paper or market_open is True:
-            if st.button(f"Confirm Trade · {_badge}", key=f"place_{_ck}", type="primary"):
-                st.session_state[_confirm_key] = True
-                st.session_state.pop(_result_key, None)
+            st.button(f"Confirm Trade · {_badge}", key=f"place_{_ck}",
+                      type="primary",
+                      on_click=confirm_gate.arm(_confirm_key, _val_keys,
+                                                clear_keys=(_result_key,),
+                                                validate=_order_error))
         elif market_open is False:
             st.button(f"Confirm Trade · {_badge}", disabled=True, key=f"place_{_ck}",
                       help="Live order — equity options trade 9:30–16:00 ET, "
@@ -479,8 +577,9 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
             st.caption("⏸ Market hours unknown")
 
     # Inline confirm step — Streamlit can't nest a dialog, so this is a review
-    # panel within the same dialog: details + Confirm to actually submit.
-    if order_ok and st.session_state.get(_confirm_key):
+    # panel within the same dialog: details + Place to actually submit. `_armed`
+    # guarantees the numbers below are the ones Confirm was pressed on.
+    if _armed:
         _acct_lbl = (cap or {}).get("mask") or "your account"
         # Account cash + cash-secured-put capacity, so the order's collateral
         # can be sanity-checked against what's available. Cash falls back to
@@ -529,9 +628,6 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         # so it takes effect on the FIRST click. An inline `if button:` would
         # set the flag only after the panel already rendered this run → the
         # collapse wouldn't show until a second click.
-        def _cancel_confirm(_k=_confirm_key):
-            st.session_state[_k] = False
-
         _cc1, _cc2, _ = st.columns([1, 1, 3])
         with _cc1:
             _submit = st.button(f"Place Trade · {_badge}", key=f"confirm_{_ck}",
@@ -539,7 +635,7 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         with _cc2:
             _cancel_box = st.container(key="investigate_cancel_box")
             _cancel_box.button("Cancel", key=f"cancel_{_ck}", width="stretch",
-                               on_click=_cancel_confirm)
+                               on_click=confirm_gate.disarm(_confirm_key))
         if _submit:
             _result = _submit_put_order(
                 scfg, order, cap, paper,
@@ -548,16 +644,15 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
             st.session_state[_result_key] = _result
             st.session_state[_confirm_key] = False
             if _result.get("ok"):
-                # Close the dialog and rerun so the Trades tab (an st.tabs panel
-                # rendered before this dialog overlay) reflects the new trade
-                # without a manual browser refresh. Queue the toast for the NEXT
-                # run (emitted in run_app) — a toast created right before
-                # st.rerun() is discarded with the current run. The rerun resets
-                # st.tabs to the first tab, so also ask run_app to switch to the
-                # Trades tab (where the new trade now shows).
+                # Rerun to close the dialog. Queue the toast for the NEXT run
+                # (emitted in run_app) — a toast created right before st.rerun()
+                # is discarded with the current run. We deliberately DON'T switch
+                # to the Trades tab: rendering it cold re-fetches live Schwab data
+                # for every tracked trade, which made placement feel like it hung
+                # for ~30s. Staying on the current (cached) tab keeps placement
+                # snappy; the toast points the user to the Trades tab.
                 st.session_state["_osc_toast"] = (
-                    _result["msg"] + "  Shown on the Trades tab.")
-                st.session_state["_osc_goto_tab"] = "Trades"
+                    _result["msg"] + "\nOpen the Trades tab to see it.")
                 st.rerun()
 
     # Failures stay in the dialog (a success path reruns + toasts above, so the
@@ -649,6 +744,10 @@ def contract_from_row(row: "pd.Series", side: str, ticker: str, *,
         "ask": _num(row.get("ask")),
         "mid": _num(row.get("mid")),
         "last": _num(row.get("last")) if "last" in idx else None,
+        # Epoch-ms of the last print (None when the scan subset omits it) — the
+        # dialog shows it as an ET time beside "Last" so a stale print is clear.
+        "last_trade_ms": (_num(row.get("last_trade_ms"))
+                          if "last_trade_ms" in idx else None),
         "iv": _num(row.get("iv")) if "iv" in idx else None,
         "spot": spot,
         "delta": _num(row.get("delta")) if "delta" in idx else None,
@@ -993,7 +1092,7 @@ def _render_table(board: pd.DataFrame, side: str, min_vol: int,
 
     if not investigate:
         st.dataframe(styled, column_config=col_cfg, hide_index=True,
-                     width="stretch")
+                     width="stretch", height=df_height(styled))
         if _has_warn:
             st.caption(EARNINGS_WARN_LEGEND)
         return
@@ -1010,7 +1109,7 @@ def _render_table(board: pd.DataFrame, side: str, min_vol: int,
     event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
                          width="stretch", on_select="rerun",
                          selection_mode="single-row",
-                         key=f"lb_investigate_{side}")
+                         key=f"lb_investigate_{side}", height=df_height(styled))
     if _has_warn:
         st.caption(EARNINGS_WARN_LEGEND)
     # Per-side open-guard key — Calls and Puts can both be selectable at once

@@ -758,6 +758,18 @@ def inject_theme() -> None:
 
 # ── Reusable rendering helpers ──────────────────────────────────────────────
 
+def df_height(obj, max_rows: int = 20) -> int:
+    """Pixel height for an st.dataframe so up to ``max_rows`` show before it
+    scrolls (Streamlit's default caps at ~10), with no empty padding for shorter
+    tables. Pass whatever is being displayed — a DataFrame or a Styler (its
+    ``.data`` gives the row count). Streamlit's row + header height is ~35px."""
+    try:
+        n = len(obj.data) if hasattr(obj, "data") else len(obj)
+    except Exception:
+        n = max_rows
+    return (min(max(int(n), 1), int(max_rows)) + 1) * 35 + 3
+
+
 def section_header(
     title: str,
     subtitle: str | None = None,

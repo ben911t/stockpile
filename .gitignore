@@ -45,6 +45,8 @@ output/
 # Allow trading-dashboard templates to be tracked
 !trading-dashboard/templates/
 !trading-dashboard/templates/**
+# Track the scanner trading test plan (interactive tracker, source of truth)
+!options-scanner/TRADING_TEST_PLAN.html
 
 # Scanner persistent cache (IV-history SQLite store, etc.)
 cache/
@@ -52,6 +54,9 @@ options-scanner/cache/
 
 # Assisted put-selling trade log (personal trade data)
 options-scanner/trades/
+
+# User preferences written by the ⚙️ Settings dialog (hidden positions, …)
+options-scanner/settings/
 
 # Images
 *.png

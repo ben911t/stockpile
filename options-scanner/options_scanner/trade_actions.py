@@ -12,6 +12,30 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+# US Eastern — options print/quote timestamps are shown in market time, so a
+# stale "Last" reads naturally against the 9:30–16:00 ET session.
+_ET = ZoneInfo("America/New_York")
+
+
+def fmt_last_trade_et(epoch_ms) -> str | None:
+    """Format a last-trade timestamp (epoch **milliseconds**, from Schwab's
+    ``tradeTimeInLong`` or a converted Yahoo ``lastTradeDate``) as
+    ``MM/DD HH:MM`` in US Eastern (24-hour). Returns None for absent/zero/NaN or
+    an unparseable value — so a missing print simply shows no time. Annotates the
+    ``Last`` cell in the pre-confirm detail tables so a stale print is obvious."""
+    try:
+        ms = float(epoch_ms)
+    except (TypeError, ValueError):
+        return None
+    if ms != ms or ms <= 0:  # NaN, None-coerced, or 0 = "no print"
+        return None
+    try:
+        dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).astimezone(_ET)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return dt.strftime("%m/%d %H:%M")
 
 # Liquidity thresholds — a deliberately conservative first guess at "would a
 # limit order here have a good chance of filling at favorable terms?". These
@@ -68,6 +92,19 @@ def ceil_to_tick(price: float) -> float:
     """
     tick = tick_for(price)
     return round(math.ceil(price / tick - 1e-9) * tick, 2)
+
+
+def floor_to_tick(price: float) -> float:
+    """Round DOWN to the conventional option tick.
+
+    Used to cap a suggested SELL limit at the current ask: the largest valid
+    tick not exceeding ``price``, so a rich IV model (or a stale ``last`` above
+    the ask) can never push the suggestion past the best offer. Mirrors
+    ceil_to_tick's epsilon so a price already on a tick doesn't drop a full tick
+    on float-division noise (3.95 stays 3.95).
+    """
+    tick = tick_for(price)
+    return round(math.floor(price / tick + 1e-9) * tick, 2)
 
 
 def assess_fill(*, bid, ask, mid=None, volume=None, open_interest=0,
@@ -500,6 +537,34 @@ def build_option_sell_order(*, ticker: str, strike: float, expiration: str,
 build_put_sell_order = build_option_sell_order
 
 
+def close_input_error(limit, contracts, held: int) -> str | None:
+    """Why this close can't be placed, or None when the inputs are usable.
+
+    The closing screens have no order-builder to validate through (a close is
+    assembled at submit time), so this is their equivalent: a positive limit and
+    a contract count between 1 and the size actually held. It exists as a
+    function rather than widget ``min_value``/``max_value`` because Streamlit
+    won't commit an out-of-range entry — it keeps the last valid value and shows
+    its own message, which would leave a Place button armed for a number the user
+    never typed. Returns the message so the caller can show it *and* use it as
+    the disabled Confirm button's tooltip.
+    """
+    if limit is None or contracts is None:
+        return "Enter a limit price and a contract count."
+    try:
+        limit, contracts = float(limit), int(contracts)
+    except (TypeError, ValueError):
+        return "Enter a limit price and a contract count."
+    if limit <= 0:
+        return "Limit price must be positive."
+    if contracts < 1:
+        return "Close at least 1 contract."
+    if contracts > int(held):
+        return (f"You hold {int(held)} contract(s) — can't close "
+                f"{contracts}.")
+    return None
+
+
 # ── Market hours + LIVE placement (only ever reached behind a confirm step) ──
 
 def market_is_open(client) -> bool | None:
@@ -621,18 +686,23 @@ def place_option_sell_order(client, order: OptionSellOrder,
 
 def place_option_close_order(client, *, ticker: str, strike: float,
                              expiration: str, limit: float, quantity: int,
-                             account_hash: str, option_type: str = "P") -> dict:
-    """Submit a BUY_TO_CLOSE limit on an existing short option. LIVE.
+                             account_hash: str, option_type: str = "P",
+                             direction: str = "short") -> dict:
+    """Submit a limit order to close an existing option leg. LIVE.
 
-    The closing mirror of place_option_sell_order: buys back the put/call to
-    close, only after the user's explicit confirm. `limit` is the debit per
-    share; `option_type` is "P" or "C".
+    A short leg (``direction="short"``, the default) closes with a
+    BUY_TO_CLOSE; a long leg (``direction="long"``) closes with a
+    SELL_TO_CLOSE. Only ever called after the user's explicit confirm. `limit`
+    is the price per share; `option_type` is "P" or "C".
     """
     if int(quantity) < 1 or float(limit) <= 0 or float(strike) <= 0:
         return {"ok": False, "order_id": None, "error": "invalid order"}
     try:
-        from schwab.orders.options import option_buy_to_close_limit
-        spec = option_buy_to_close_limit(
+        from schwab.orders.options import (option_buy_to_close_limit,
+                                           option_sell_to_close_limit)
+        _build = (option_sell_to_close_limit if str(direction) == "long"
+                  else option_buy_to_close_limit)
+        spec = _build(
             _osi(ticker, strike, expiration, option_type),
             int(quantity), f"{float(limit):.2f}")
     except Exception as exc:  # noqa: BLE001 — bad date / build failure
@@ -865,8 +935,9 @@ def requote_option(client, ticker: str, expiration: str, strike: float,
     ``option_type`` ("P"/"C", or put/call) picks the calls or puts table — a
     covered call must re-quote the CALL, not the put at the same strike. Read-
     only; reuses ``schwab_live.fetch_option_chain_schwab``. Returns {bid, ask,
-    mid, last, volume, open_interest, iv, delta} or None when unavailable (iv as
-    a fraction; iv/delta are None when Schwab omits them).
+    mid, last, volume, open_interest, iv, delta, last_trade_ms} or None when
+    unavailable (iv as a fraction; iv/delta are None when Schwab omits them;
+    last_trade_ms is the last print's epoch-ms, 0 when Schwab omits it).
     """
     from stocks_shared.schwab_live import fetch_option_chain_schwab
     try:
@@ -889,11 +960,15 @@ def requote_option(client, ticker: str, expiration: str, strike: float,
     mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
     _vol_pct = float(r.get("volatility", 0) or 0)   # Schwab IV is a percent
     _delta = float(r.get("delta", 0) or 0)
+    # Epoch-ms of the last print (Schwab tradeTimeInLong, kept by the chain
+    # fetcher). 0 when absent — the display treats that as "no time".
+    _last_ms = int(r.get("last_trade_ms", 0) or 0)
     return {"bid": bid, "ask": ask, "mid": mid, "last": last,
             "volume": int(r.get("volume", 0) or 0),
             "open_interest": int(r.get("openInterest", 0) or 0),
             "iv": (_vol_pct / 100.0) if _vol_pct else None,
-            "delta": _delta if _delta else None}
+            "delta": _delta if _delta else None,
+            "last_trade_ms": _last_ms}
 
 
 def requote_put(client, ticker: str, expiration: str,

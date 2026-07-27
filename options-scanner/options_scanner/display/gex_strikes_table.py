@@ -16,6 +16,7 @@ import streamlit as st
 
 from options_scanner.compute.gex_summary import per_strike_gex
 from options_scanner.format import fmt_strike
+from options_scanner.ui_theme import df_height
 
 
 def fmt_strike_with_dist(strike: float | None, spot: float) -> str:
@@ -72,7 +73,7 @@ def show_gex_strikes_of_interest(df: pd.DataFrame, spot: float) -> None:
         "this strike tend to accelerate; sellers should size cautiously."
     )
     st.dataframe(
-        out, hide_index=True, width='content',
+        out, hide_index=True, width='content', height=df_height(out),
         column_config={
             "Tag":      st.column_config.TextColumn(),
             "Strike":   st.column_config.NumberColumn(format="$%.2f"),

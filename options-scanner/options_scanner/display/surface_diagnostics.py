@@ -28,6 +28,7 @@ import streamlit as st
 
 from options_scanner import iv_algorithms, iv_filters
 from options_scanner.display.chain_styling import CELL_WARN
+from options_scanner.ui_theme import df_height
 
 _FALLBACK_METHODS = {"fallback", "none"}
 _METHOD_LABEL = {
@@ -107,6 +108,7 @@ def show_surface_diagnostics(df_full: pd.DataFrame,
             funnel_rows, columns=["Stage", "Remaining", "Dropped"])
         st.dataframe(
             funnel_df, hide_index=True, width="stretch",
+            height=df_height(funnel_df),
             column_config={
                 "Stage": st.column_config.TextColumn("Stage", width=260),
                 "Remaining": st.column_config.NumberColumn(
@@ -147,6 +149,7 @@ def show_surface_diagnostics(df_full: pd.DataFrame,
         styled = exp_df.style.apply(_flag_fallback, axis=1)
         st.dataframe(
             styled, hide_index=True, width="stretch",
+            height=df_height(styled),
             column_config={
                 "Expiration": st.column_config.TextColumn(
                     "Expiration", width=105),

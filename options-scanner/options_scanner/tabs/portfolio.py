@@ -43,7 +43,7 @@ from options_scanner.defaults import default_delta_range
 from options_scanner.fetch import fetch_position
 from options_scanner.portfolio import detect_brokerage
 from options_scanner.ui_theme import (
-    badge, metric_card, render_schwab_reauth_hint, section_header,
+    badge, df_height, metric_card, render_schwab_reauth_hint, section_header,
 )
 from options_scanner import watchlists
 
@@ -181,7 +181,8 @@ def _show_validation(issues: list, row_count: int, parse_error: str | None,
             return [color] * len(row)
 
         styled = df.style.apply(_row_style, axis=1)
-        st.dataframe(styled, hide_index=True, width="stretch")
+        st.dataframe(styled, hide_index=True, width="stretch",
+                     height=df_height(styled))
 
     return not errors
 
@@ -342,9 +343,12 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
             st.session_state[f"{k}_wl_name"] = entry["name"]
             st.session_state[f"{k}_min_dte"]  = max(1, int(entry.get("min_dte", 30)))
             # A saved watchlist with no max DTE (null/0) loads as an empty field.
+            # Write the persistent companion key; the Max DTE widget mirrors it
+            # (see the control below) — setting the widget key directly wouldn't
+            # survive the mirror on the next render.
             _e_max = entry.get("max_dte", 90)
-            st.session_state[f"{k}_max_dte"]  = (max(1, int(_e_max)) if _e_max
-                                                 else None)
+            st.session_state[f"{k}_max_dte_choice"] = (max(1, int(_e_max))
+                                                       if _e_max else None)
             st.session_state[f"{k}_min_oi"]   = max(0, int(entry.get("min_oi", 25)))
             st.session_state[f"{k}_min_vol"]  = max(0, int(entry.get("min_vol", 1)))
             st.session_state[f"{k}_delta"]    = (_dmin, _dmax)
@@ -475,13 +479,26 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
                                        key=f"{k}_min_dte")
     with pc2:
         # Nullable: empty = no maximum DTE (scan every expiration >= Min DTE).
-        # Seed the 90 default once so a fresh load isn't unbounded, but allow
-        # clearing the field (value=None makes the input nullable; a non-None
-        # value would snap a cleared field back to it).
-        st.session_state.setdefault(f"{k}_max_dte", 90)
+        # The widget's OWN state is fragile across a tab switch: a *cleared*
+        # (None) value doesn't survive this tab being unrendered, so on return
+        # the `setdefault` seed used to snap an intentionally-empty field back to
+        # 90 (Min DTE, being non-None, persisted fine — hence the asymmetry).
+        # Fix: keep the user's choice — INCLUDING a deliberate clear — in a
+        # companion key that does persist (a plain session_state entry, never a
+        # widget key, so it's not garbage-collected), and mirror it into the
+        # widget key before the widget renders. `value=None` keeps the field
+        # clearable and (default_value None) avoids the "set via Session State"
+        # warning despite the pre-seed.
+        _mk, _mk_choice = f"{k}_max_dte", f"{k}_max_dte_choice"
+        st.session_state.setdefault(_mk_choice, 90)   # first-load default only
+        st.session_state[_mk] = st.session_state[_mk_choice]
+
+        def _remember_max_dte(_w=_mk, _c=_mk_choice):
+            st.session_state[_c] = st.session_state[_w]
+
         port_max_dte = st.number_input(
-            "Max DTE", min_value=1, step=1, value=None, key=f"{k}_max_dte",
-            placeholder="No max",
+            "Max DTE", min_value=1, step=1, value=None, key=_mk,
+            placeholder="No max", on_change=_remember_max_dte,
             help="Leave empty for no maximum DTE (every expiration ≥ Min DTE).")
     _max_dte_arg = int(port_max_dte) if port_max_dte is not None else None
     with pc3:

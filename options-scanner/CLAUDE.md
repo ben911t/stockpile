@@ -78,6 +78,87 @@ uv run options-scanner/run_scanner.py AAPL --calls \
 Never use `python` directly — dependencies won't be resolved.
 Run `uv sync` from repo root after any `pyproject.toml` change.
 
+## Order entry: the Confirm → Place gate
+
+Every screen that can send an order (Sell Put/Call dialog, tracked-trade
+close, live-position close, roll) goes through `confirm_gate.py`. The
+invariants, which any new order screen must keep:
+
+- **Place** renders only when Confirm was pressed *on the values now on
+  screen* and those values still validate.
+- Editing the limit or the contract count **disarms** — back to Confirm.
+  The confirm step attests to specific numbers, not to a general
+  intention to trade.
+- Confirm is disabled while armed; **Cancel** is the way back. The two
+  buttons are never both live.
+- Confirm stays **clickable while the inputs are invalid** — it just
+  refuses to arm, and the error stays on screen. Never disable it for a
+  bad value: Streamlit commits a number box only on blur, so a disabled
+  button forces "click away, wait for it to re-enable, then click
+  Confirm". Pass `validate=` to `confirm_gate.arm()` instead; the
+  callback sees the values as of the click. Only blocks the user can't
+  fix by editing (paper mode, market hours) disable the button.
+- An emptied number box returns `None` from `st.number_input` — check
+  `confirm_gate.valid_values()` before casting, or `int(None)` raises.
+- **Never put `min_value`/`max_value` on an order-entry number input.**
+  Streamlit refuses to *commit* an out-of-range entry: it shows its own
+  "must be ≤ N" message and keeps serving the last valid value. Typing 5
+  contracts against a 4-contract cover therefore left the app holding 1
+  — valid, so the order built and Place armed for a size nobody typed.
+  Leave the widget unbounded and validate in our code
+  (`build_option_sell_order`, `build_roll_order`,
+  `close_input_error`), which sees the real number and explains the
+  rejection. Keep the cap in the label ("Contracts (Max 4)") as
+  guidance. Scan-filter inputs may keep their bounds — they gate
+  nothing.
+
+Arm with the `on_click` callbacks (`arm` / `disarm`), never an inline
+`if st.button(...)`: a callback runs before the rerun renders, so the
+button states are consistent within a single frame.
+
+Also: don't write a live default straight into a keyed input on every
+rerun. Use `confirm_gate.reseed_on_change()`, which re-seeds only when
+the *basis* changes — an unconditional write clobbers the number the
+user is mid-correction, so the error describing it never renders.
+
+**After placing**, every Place path must:
+
+1. disarm the gate,
+2. on success, queue the center banner (`st.session_state["_osc_toast"]`)
+   **and** drop the stored result so it can't also render inline,
+3. `st.rerun()` — a **full** rerun, not `scope="fragment"`: `run_app`
+   renders the banner.
+
+The rerun is not optional. Disarming only takes effect on the *next*
+run, so without it the panel the click came from stays on screen with
+Place still live (which is exactly what the paper close used to do).
+Dialogs are the one exception: `st.rerun()` closes a dialog, so the Sell
+and Roll dialogs rerun on success only and keep a failure visible inline.
+
+## Settings: two config layers, kept disjoint
+
+- `config.toml` — machine + secrets layer. Schwab credentials, the
+  `paper` live-order gate, default provider. **Hand-edited only; the app
+  never writes it.** `tomllib` is read-only, a TOML writer would drop
+  the comments that document the file, and `config.py`'s lenient loader
+  exists because this file gets hand-edited and breaks.
+- `settings/settings.json` — preference layer, written by the ⚙️
+  Settings dialog (`settings_store.py` + `settings_ui.py`). Nothing
+  security- or safety-critical goes here, so a mis-click can't arm live
+  trading. Read per rerun, so edits apply with no restart.
+
+Never add a credential or the `paper` flag to the JSON layer, and never
+put a preference in both files — disjoint keys mean there's no
+precedence question.
+
+**Hidden positions are display-only.** `position_filters` rules are
+applied where the Close/Roll tabs *render* (never inside
+`positions_cache` or `trade_actions`), because coverage and sizing must
+keep seeing every leg — hiding a short call must not free its shares for
+a second covered call. Filtering after the cached read also means a
+settings change lands on the next rerun instead of waiting out the 60s
+TTL.
+
 ## Output columns
 
 | Column  | Meaning                                            |

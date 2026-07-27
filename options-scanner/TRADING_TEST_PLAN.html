@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Features — Test Plan</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --ink: #1a1d21;
+    --muted: #5b6470;
+    --line: #e3e6ea;
+    --shadow: 0 1px 2px rgba(0,0,0,.06), 0 3px 8px rgba(0,0,0,.05);
+    --accent: #2563eb;
+    --ok-bg: #e7f6ec; --ok-fg: #1a7f37; --ok-line: #a7e3ba;
+    --fail-bg: #fdeaea; --fail-fg: #c62828; --fail-line: #f2b8b8;
+    --no-bg: #f1f3f5; --no-fg: #6b7280; --no-line: #dde1e6;
+    --paper-bg: #eaf1ff; --paper-fg: #2554c7;
+    --live-bg: #fdecec; --live-fg: #c62828;
+    --either-bg: #eef0f2; --either-fg: #52606d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171a;
+      --card: #1d2125;
+      --ink: #e7eaed;
+      --muted: #9aa4b0;
+      --line: #2b3138;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 3px 10px rgba(0,0,0,.35);
+      --accent: #5b9dff;
+      --ok-bg: #14331f; --ok-fg: #6fdd93; --ok-line: #245c37;
+      --fail-bg: #3a1a1a; --fail-fg: #ff9a9a; --fail-line: #6b2b2b;
+      --no-bg: #22272c; --no-fg: #8b95a1; --no-line: #333a42;
+      --paper-bg: #182742; --paper-fg: #8fb4ff;
+      --live-bg: #3a1c1c; --live-fg: #ff9a9a;
+      --either-bg: #262c33; --either-fg: #9aa4b0;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  .wrap { max-width: none; margin: 0; padding: 24px 28px 80px; }
+  header h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: -.01em; }
+  header p.sub { margin: 0 0 18px; color: var(--muted); }
+
+  /* Sticky summary bar */
+  .summary {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 14px 16px;
+    margin-bottom: 22px;
+  }
+  .summary-top { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+  .counts { display: flex; gap: 10px; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; align-items: baseline; gap: 6px;
+    padding: 5px 11px; border-radius: 999px; font-weight: 600; font-size: 13px;
+    border: 1px solid transparent;
+  }
+  .chip b { font-size: 15px; }
+  .chip.ok   { background: var(--ok-bg);   color: var(--ok-fg);   border-color: var(--ok-line); }
+  .chip.fail { background: var(--fail-bg); color: var(--fail-fg); border-color: var(--fail-line); }
+  .chip.no   { background: var(--no-bg);   color: var(--no-fg);   border-color: var(--no-line); }
+  .chip.total{ background: transparent; color: var(--muted); border-color: var(--line); }
+  .spacer { flex: 1 1 auto; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 13px; font-weight: 600;
+    padding: 7px 12px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+    transition: background .12s, border-color .12s;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .progress-track {
+    margin-top: 12px; height: 8px; border-radius: 999px;
+    background: var(--no-bg); overflow: hidden; display: flex;
+  }
+  .progress-track .seg-ok   { background: var(--ok-fg);   height: 100%; }
+  .progress-track .seg-fail { background: var(--fail-fg); height: 100%; }
+  .progress-label { margin-top: 6px; font-size: 12px; color: var(--muted); }
+
+  details.pre {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 6px 16px; margin-bottom: 22px; box-shadow: var(--shadow);
+  }
+  details.pre > summary { cursor: pointer; font-weight: 600; padding: 8px 0; }
+  details.pre ul { margin: 4px 0 12px; padding-left: 20px; color: var(--muted); }
+  details.pre code {
+    background: var(--no-bg); padding: 1px 5px; border-radius: 5px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px;
+  }
+
+  .pass-banner {
+    margin: 34px 0 16px; padding: 12px 18px; border-radius: 12px;
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  .pass-banner:first-child { margin-top: 4px; }
+  .pass-banner .pass-title { font-size: 18px; font-weight: 800; letter-spacing: -.01em; }
+  .pass-banner .pass-note { font-size: 13px; font-weight: 500; opacity: .82; }
+  .pass-banner .pass-count { margin-left: auto; font-size: 13px; font-weight: 700; opacity: .85; white-space: nowrap; }
+  .pass-banner.paper { background: var(--paper-bg); color: var(--paper-fg); }
+  .pass-banner.live  { background: var(--live-bg);  color: var(--live-fg); }
+
+  section.block {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; box-shadow: var(--shadow);
+    margin-bottom: 20px; overflow: hidden;
+  }
+  section.block > h2 {
+    margin: 0; padding: 14px 18px; font-size: 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  section.block > p.desc { margin: 12px 18px 0; color: var(--muted); font-size: 13.5px; }
+  .table-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; vertical-align: top; border-top: 1px solid var(--line); }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }
+  thead th { border-top: none; }
+  td.id { font-weight: 700; white-space: nowrap; color: var(--muted); }
+  td.todo { min-width: 220px; }
+  td.expected { min-width: 200px; color: var(--muted); font-size: 13.5px; }
+  th.col-notes, td.notes { width: 34%; }
+
+  .mode { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .mode.Paper  { background: var(--paper-bg); color: var(--paper-fg); }
+  .mode.Live   { background: var(--live-bg);  color: var(--live-fg); }
+  .mode.Either { background: var(--either-bg); color: var(--either-fg); }
+
+  select.status {
+    font: inherit; font-weight: 600; padding: 6px 8px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink); cursor: pointer;
+  }
+  tr[data-status="Success"] { background: color-mix(in srgb, var(--ok-bg) 55%, transparent); }
+  tr[data-status="Fail"]    { background: color-mix(in srgb, var(--fail-bg) 55%, transparent); }
+  tr[data-status="Success"] select.status { border-color: var(--ok-line);  color: var(--ok-fg); }
+  tr[data-status="Fail"]    select.status { border-color: var(--fail-line); color: var(--fail-fg); }
+
+  textarea.note {
+    font: inherit; font-size: 13px; width: 100%; min-width: 300px; resize: vertical;
+    min-height: 34px; padding: 6px 8px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  }
+  .saved-flash {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--ink); color: var(--bg); padding: 8px 16px; border-radius: 999px;
+    font-size: 13px; font-weight: 600; opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .saved-flash.show { opacity: .92; }
+  footer.note-area { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Trading Features — Test Plan</h1>
+    <p class="sub">Exercises every order-placing / order-closing flow in the scanner UI — opening, closing, and rolling. Grouped into a <b>Paper pass</b> (do any time) first, then a <b>Live pass</b> (market hours). Set each <b>Status</b> as you go; progress saves automatically in this browser.</p>
+  </header>
+
+  <div class="summary" id="summary">
+    <div class="summary-top">
+      <div class="counts">
+        <span class="chip ok">Success <b id="c-ok">0</b></span>
+        <span class="chip fail">Fail <b id="c-fail">0</b></span>
+        <span class="chip no">Not tested <b id="c-no">0</b></span>
+        <span class="chip total">of <b id="c-total">35</b></span>
+      </div>
+      <span class="spacer"></span>
+      <div class="actions">
+        <button id="btn-md" class="primary">Copy updated Markdown</button>
+        <button id="btn-export">Download progress</button>
+        <button id="btn-import">Import…</button>
+        <button id="btn-reset">Reset all</button>
+      </div>
+    </div>
+    <div class="progress-track" id="track">
+      <div class="seg-ok" id="seg-ok"></div>
+      <div class="seg-fail" id="seg-fail"></div>
+    </div>
+    <div class="progress-label" id="prog-label">0 of 35 tested</div>
+  </div>
+
+  <details class="pre">
+    <summary>Preconditions &amp; status legend</summary>
+    <ul>
+      <li>Launch with <code>uv run run.py</code> (or <code>uv run streamlit run options-scanner/run_app.py</code>).</li>
+      <li>Top bar <b>data source = Schwab</b>. Empty quotes → token expired, re-run <code>schwab_auth.py</code>.</li>
+      <li><b>Mode</b> is the <code>paper</code> flag in <code>options-scanner/config.toml</code>: <code>paper = true</code> → PAPER (nothing sent to broker); <code>paper = false</code> → LIVE (real orders to account …8556, needs an app restart to change).</li>
+      <li>Live orders are gated to market hours (9:30–16:00 ET, Mon–Fri) and use real money — test minimal size (1 contract), far OTM, comfortable limit.</li>
+      <li>Covered calls need 100+ shares held; cash-secured puts need cash (<code>availableFundsNonMarginableTrade</code>).</li>
+      <li>Every placement/close is two-step: a <em>Confirm…</em> button opens a panel, a <em>Place…</em> button actually sends. Verify at your broker after each live test.</li>
+      <li><b>Legend:</b> <code>No</code> = not yet tested · <code>Success</code> = behaved as expected · <code>Fail</code> = did not (note what happened).</li>
+    </ul>
+  </details>
+
+  <div id="sections"></div>
+
+  <footer class="note-area">
+    <p>Progress is stored only in this browser (localStorage). Use <b>Download progress</b> to keep a copy (and <b>Import…</b> to restore it in another browser), or <b>Copy updated Markdown</b> to export your results as a markdown table you can paste anywhere.</p>
+  </footer>
+</div>
+<div class="saved-flash" id="flash">Saved</div>
+
+<script>
+const DATA = [
+  { id:'A', title:'A. Sell cash-secured put — Watchlist leaderboard',
+    desc:'Watchlist tab → run a scan → Puts leaderboard → select a put row → Sell Put dialog.',
+    rows:[
+      {id:'A1', todo:'Place a CSP: pick a row, keep default limit + 1 contract, Confirm Trade → Place Trade', mode:'Paper', exp:'In the Sell Put dialog: 📝 PAPER badge (title + buttons); "Avail Cash" note beside the Contracts field. After Place Trade: a confirmation banner, then it appears on the Trades tab under "Trades made from Scanner" as open. Nothing sent to the broker.'},
+      {id:'A2', todo:'Same as A1', mode:'Live', exp:'In the Sell Put dialog: 🔴 LIVE badge (title + buttons). After Place Trade: a real SELL_TO_OPEN is sent → confirmation banner with the order id, then it appears on the Trades tab (with id). Confirm it at your broker.'},
+      {id:'A3', todo:'In the dialog, edit limit + contracts; watch the "Avail Cash" note and the "Contracts (Max N)" cap', mode:'Either', exp:'All in the dialog: Contracts capped at Max N (by cash); "Avail Cash: $X, ($Y each)" beside the fields; the order preview updates as you edit.'},
+      {id:'A4', todo:'Try to place with market closed (live)', mode:'Live', exp:'In the dialog: Place Trade is disabled with a "market closed / hours unknown" note.'},
+      {id:'A5', todo:'Thin/wide market row', mode:'Either', exp:'In the dialog: amber "Thin/wide market" warning + a red suggested limit (IV-aligned, capped at the ask). Placement is still allowed.'},
+    ]},
+  { id:'B', title:'B. Sell covered call — Watchlist leaderboard',
+    desc:'Watchlist → Calls leaderboard (needs 100+ shares held of the ticker).',
+    rows:[
+      {id:'B1', todo:'Place a covered call on a held name: select row, Confirm Trade → Place Trade', mode:'Paper', exp:'In the Sell Call dialog: 📝 PAPER badge (title + buttons) and, beside the Contracts field, a coverage note "Shares held N (0 already in calls). 100 shares cover each call." After Place Trade: a confirmation banner, then it appears on the Trades tab under "Trades made from Scanner" as open. Nothing sent to the broker. (The coverage note lives only in the dialog — it is NOT on the Trades tab.)'},
+      {id:'B2', todo:'Same as B1', mode:'Live', exp:'In the Sell Call dialog: 🔴 LIVE badge (title + buttons). After Place Trade: a real SELL_TO_OPEN is sent → confirmation banner with the order id, then it appears on the Trades tab. Confirm it at your broker.'},
+      {id:'B3', todo:'Coverage gating', mode:'Either', exp:'In the Calls leaderboard (before the dialog): only coverable rows are selectable; a separate "Not coverable" table lists names you hold under 100 sh of (no checkbox).'},
+    ]},
+  { id:'C', title:'C. Close a scanner-tracked position — Trades tab',
+    desc:'Trades tab → Trades made from Scanner. Select an open trade\'s close controls: Confirm Closing Trade → Place Closing Trade.',
+    rows:[
+      {id:'C1', todo:'Full close of a paper trade', mode:'Paper', exp:'The close controls appear on the open paper trade right away (📝 PAPER badge on the buttons, no market-hours gate — there is no broker order to wait on). After Place Closing Trade: marked closed; REALIZED P/L = credit − close cost; nothing sent to the broker.'},
+      {id:'C2', todo:'Partial close of a paper trade (Contracts < qty)', mode:'Paper', exp:'Splits: closed record for N, remainder stays open'},
+      {id:'C3', todo:'Full close of a live position (BUY_TO_CLOSE)', mode:'Live', exp:'Shows closing, then closed with REALIZED P/L when it fills'},
+      {id:'C4', todo:'Partial close of a live position', mode:'Live', exp:'On fill: N contracts closed, remainder returns to open'},
+      {id:'C5', todo:'Cancel a working closing order', mode:'Live', exp:'Cancel closing order → position reverts to open'},
+      {id:'C6', todo:'Cancel a working opening order (unfilled sell-to-open)', mode:'Live', exp:'Cancel working order → trade canceled'},
+      {id:'C7', todo:'Remove from Tracker (a paper/closed record)', mode:'Either', exp:'Record disappears from the list'},
+      {id:'C8', todo:'Close a live position while app is in paper mode', mode:'Paper', exp:'Blocked with "live position can\'t be closed in paper mode" note'},
+      {id:'C9', todo:'Cancel (discard paper trade)', mode:'Paper', exp:'A third button beside the paper trade close controls. Marks the record canceled and books NO close and no P/L (a trade you decided against is not a closed trade); toast "Paper trade canceled". Remove from Tracker still deletes the record outright.'},
+    ]},
+  { id:'D', title:'D. Roll a position — Roll tab',
+    desc:'Roll tab (Schwab). A roll acts on a REAL position, so PLACING one needs paper=false — in paper mode the tab can only build and price a roll (that is D5, the one row in the Paper pass). Select a rollable position → build → select a target row → confirm dialog → Place Roll.',
+    rows:[
+      {id:'D1', todo:'Roll a short covered call to a new strike/expiry', mode:'Live', exp:'Net-price order sent; row shows under In-flight rolls as rolling; new leg appears on fill'},
+      {id:'D2', todo:'Roll a short put', mode:'Live', exp:'Same as D1 for the put'},
+      {id:'D3', todo:'Cancel an in-flight roll', mode:'Live', exp:'Cancel roll → original position unchanged; record cleared'},
+      {id:'D4', todo:'Roll order terminates unfilled (expire/reject)', mode:'Live', exp:'One-time note; original position restored; no phantom trade'},
+      {id:'D5', todo:'Open Roll tab in paper mode', mode:'Paper', exp:'Warning that placing needs paper=false; can build/price only'},
+      {id:'D6', todo:'Selecting a row scrolls the roll detail into view', mode:'Either', exp:'Page scrolls so the expanded detail is visible'},
+    ]},
+  { id:'E', title:'E. Close Options (Schwab) — Close tab',
+    desc:'Close tab → Close Options (Schwab) table (all live legs). Select a row → close builder → Confirm Close → Place Close.',
+    rows:[
+      {id:'E1', todo:'Close an untracked short call/put (full)', mode:'Live', exp:'BUY_TO_CLOSE sent; a closing record appears under Trades; finalizes to closed with REALIZED P/L on fill'},
+      {id:'E2', todo:'Partial close of an untracked short', mode:'Live', exp:'Only N contracts close; the rest stays at the broker (still in this table)'},
+      {id:'E3', todo:'Close a long leg (sell-to-close)', mode:'Live', exp:'SELL_TO_CLOSE sent; result notes it\'s not logged to Trades'},
+      {id:'E4', todo:'Close a leg that\'s tracked (sold from scanner)', mode:'Live', exp:'Routes through the tracked flow; shows closing up top; tagged "tracked" in the table'},
+      {id:'E5', todo:'Re-select a leg that already has a working close', mode:'Live', exp:'Blocked: "⏳ A closing order is already working…" (no duplicate order)'},
+      {id:'E6', todo:'Open the section in paper mode', mode:'Paper', exp:'Table renders read-only; close builder shows "needs paper=false"'},
+      {id:'E7', todo:'Untracked close terminates unfilled', mode:'Live', exp:'Record dropped (no phantom open trade); position unchanged in the table'},
+      {id:'E8', todo:'Verify table columns', mode:'Either', exp:'Type = "Put - Short"; live Delta; Ann% (remaining time value); Spot/Day% colored green/red'},
+    ]},
+  { id:'F', title:'F. Cross-cutting safety & gating',
+    desc:'',
+    rows:[
+      {id:'F1', todo:'Confirm badges everywhere', mode:'Either', exp:'📝 PAPER vs 🔴 LIVE shown on titles/buttons matches the config flag'},
+      {id:'F2', todo:'Two-step confirm on every action', mode:'Either', exp:'No order is sent on the first (Confirm…) click — only the Place… button in the panel sends'},
+      {id:'F3', todo:'Cancel on any confirm panel', mode:'Either', exp:'Cancel collapses the panel on the first click; nothing sent'},
+      {id:'F4', todo:'Expired Schwab token mid-session', mode:'Either', exp:'Re-auth hint / "re-run schwab_auth.py"; no crash'},
+      {id:'F5', todo:'Switching data source to Yahoo', mode:'Either', exp:'Trade/Roll/Close sections show "connect Schwab" notices; no order paths exposed'},
+    ]},
+];
+
+const PASSES = [
+  { key:'paper', title:'Paper pass', klass:'paper',
+    note:'Run any time — paper = true. Nothing is sent to the broker. Includes “Either” tests, which are fine to run in paper.',
+    modes:['Paper','Either'] },
+  { key:'live', title:'Live pass', klass:'live',
+    note:'Needs paper = false and market hours (9:30–16:00 ET, Mon–Fri). Real orders to account …8556.',
+    modes:['Live'] },
+];
+
+// Regroup the six feature areas into two passes by mode, preserving row order.
+function buildPasses() {
+  return PASSES.map(p => ({
+    ...p,
+    areas: DATA.map(area => ({
+      id: area.id, title: area.title, desc: area.desc,
+      rows: area.rows.filter(r => p.modes.includes(r.mode)),
+    })).filter(area => area.rows.length > 0),
+  }));
+}
+
+const STORE_KEY = 'trading_test_plan_v1';
+const STATUSES = ['No', 'Success', 'Fail'];
+let state = load();
+
+function load() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; }
+  catch(e) { return {}; }
+}
+function save() {
+  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+  flash();
+}
+let flashTimer;
+function flash() {
+  const f = document.getElementById('flash');
+  f.classList.add('show');
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => f.classList.remove('show'), 900);
+}
+
+function allRows() { return DATA.flatMap(s => s.rows); }
+
+function render() {
+  const host = document.getElementById('sections');
+  host.innerHTML = '';
+  for (const pass of buildPasses()) {
+    const n = pass.areas.reduce((a, ar) => a + ar.rows.length, 0);
+    const banner = document.createElement('div');
+    banner.className = 'pass-banner ' + pass.klass;
+    banner.innerHTML = `<span class="pass-title">${pass.title}</span>
+      <span class="pass-note">${pass.note}</span>
+      <span class="pass-count">${n} tests</span>`;
+    host.appendChild(banner);
+
+    for (const sec of pass.areas) {
+      const el = document.createElement('section');
+      el.className = 'block';
+      const descHtml = sec.desc ? `<p class="desc">${sec.desc}</p>` : '';
+      el.innerHTML = `<h2>${sec.title}</h2>${descHtml}
+        <div class="table-scroll"><table>
+          <thead><tr><th>#</th><th>What to do</th><th>Mode</th><th>Expected</th><th>Status</th><th class="col-notes">Notes</th></tr></thead>
+          <tbody></tbody></table></div>`;
+      const tb = el.querySelector('tbody');
+      for (const r of sec.rows) {
+        const cur = state[r.id] || {};
+        const status = cur.status || 'No';
+        const note = cur.note || '';
+        const tr = document.createElement('tr');
+        tr.dataset.status = status;
+        tr.innerHTML = `
+          <td class="id">${r.id}</td>
+          <td class="todo">${r.todo}</td>
+          <td><span class="mode ${r.mode}">${r.mode}</span></td>
+          <td class="expected">${r.exp}</td>
+          <td>${selectHtml(r.id, status)}</td>
+          <td class="notes"><textarea class="note" data-id="${r.id}" placeholder="notes / what happened">${escapeHtml(note)}</textarea></td>`;
+        tb.appendChild(tr);
+      }
+      host.appendChild(el);
+    }
+  }
+  wire();
+  updateSummary();
+}
+
+function selectHtml(id, status) {
+  const opts = STATUSES.map(s => `<option value="${s}"${s===status?' selected':''}>${s}</option>`).join('');
+  return `<select class="status" data-id="${id}">${opts}</select>`;
+}
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function wire() {
+  document.querySelectorAll('select.status').forEach(sel => {
+    sel.addEventListener('change', e => {
+      const id = e.target.dataset.id;
+      state[id] = state[id] || {};
+      state[id].status = e.target.value;
+      e.target.closest('tr').dataset.status = e.target.value;
+      save(); updateSummary();
+    });
+  });
+  document.querySelectorAll('textarea.note').forEach(ta => {
+    ta.addEventListener('input', e => {
+      const id = e.target.dataset.id;
+      state[id] = state[id] || {};
+      state[id].note = e.target.value;
+      save();
+    });
+  });
+}
+
+function updateSummary() {
+  const rows = allRows();
+  const total = rows.length;
+  let ok = 0, fail = 0;
+  for (const r of rows) {
+    const s = (state[r.id] && state[r.id].status) || 'No';
+    if (s === 'Success') ok++; else if (s === 'Fail') fail++;
+  }
+  const no = total - ok - fail;
+  document.getElementById('c-ok').textContent = ok;
+  document.getElementById('c-fail').textContent = fail;
+  document.getElementById('c-no').textContent = no;
+  document.getElementById('c-total').textContent = total;
+  document.getElementById('seg-ok').style.width = (ok/total*100) + '%';
+  document.getElementById('seg-fail').style.width = (fail/total*100) + '%';
+  document.getElementById('prog-label').textContent = `${ok+fail} of ${total} tested`;
+}
+
+/* ---- Actions ---- */
+document.getElementById('btn-reset').addEventListener('click', () => {
+  if (!confirm('Reset all statuses and notes? This clears saved progress in this browser.')) return;
+  state = {}; save(); render();
+});
+document.getElementById('btn-export').addEventListener('click', () => {
+  const blob = new Blob([JSON.stringify(state, null, 2)], {type:'application/json'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'trading-test-plan-progress.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+document.getElementById('btn-import').addEventListener('click', () => {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'application/json,.json';
+  inp.onchange = () => {
+    const file = inp.files[0]; if (!file) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      try { state = JSON.parse(rd.result) || {}; save(); render(); }
+      catch(e){ alert('Could not parse that file.'); }
+    };
+    rd.readAsText(file);
+  };
+  inp.click();
+});
+document.getElementById('btn-md').addEventListener('click', () => {
+  navigator.clipboard.writeText(buildMarkdown()).then(
+    () => { const b=document.getElementById('btn-md'); const t=b.textContent; b.textContent='Copied!'; setTimeout(()=>b.textContent=t,1200); },
+    () => alert('Clipboard blocked — download progress instead.')
+  );
+});
+
+function buildMarkdown() {
+  const rows = allRows();
+  let ok=0, fail=0;
+  for (const r of rows){ const s=(state[r.id]&&state[r.id].status)||'No'; if(s==='Success')ok++; else if(s==='Fail')fail++; }
+  let out = '# Trading Features — Test Plan (progress)\n\n';
+  for (const pass of buildPasses()) {
+    out += `# ${pass.title}\n\n${pass.note}\n\n`;
+    for (const sec of pass.areas) {
+      out += `## ${sec.title}\n\n`;
+      if (sec.desc) out += sec.desc + '\n\n';
+      out += '| # | What to do | Mode | Expected | Status | Notes |\n|---|---|---|---|---|---|\n';
+      for (const r of sec.rows) {
+        const cur = state[r.id] || {};
+        const st = cur.status || 'No';
+        const note = (cur.note || '').replace(/\|/g,'\\|').replace(/\n/g,' ');
+        out += `| ${r.id} | ${r.todo.replace(/\|/g,'\\|')} | ${r.mode} | ${r.exp.replace(/\|/g,'\\|')} | ${st} | ${note} |\n`;
+      }
+      out += '\n';
+    }
+  }
+  // Summary by area
+  out += '## Summary\n\n| Area | Total | Success | Fail | Not tested |\n|---|---|---|---|---|\n';
+  for (const sec of DATA) {
+    let a=0,f=0; const t=sec.rows.length;
+    for (const r of sec.rows){ const s=(state[r.id]&&state[r.id].status)||'No'; if(s==='Success')a++; else if(s==='Fail')f++; }
+    out += `| ${sec.title.split('—')[0].trim()} | ${t} | ${a} | ${f} | ${t-a-f} |\n`;
+  }
+  out += `| **Total** | **${rows.length}** | **${ok}** | **${fail}** | **${rows.length-ok-fail}** |\n`;
+  return out;
+}
+
+render();
+</script>
+</body>
+</html>

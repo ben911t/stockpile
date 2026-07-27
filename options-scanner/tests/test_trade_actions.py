@@ -26,6 +26,16 @@ def test_ceil_to_tick():
     assert ta.ceil_to_tick(3.95) == 3.95     # float-noise guard: no jump
 
 
+def test_floor_to_tick():
+    assert ta.floor_to_tick(3.98) == 3.95    # nickel tick rounds DOWN
+    assert ta.floor_to_tick(2.459) == 2.45   # penny tick rounds DOWN
+    assert ta.floor_to_tick(3.95) == 3.95    # already on tick, unchanged
+    assert ta.floor_to_tick(3.90) == 3.90    # float-noise guard: no drop
+    # Capping a SELL suggestion at the ask: the result never exceeds the ask.
+    for ask in (0.03, 0.55, 3.04, 12.37):
+        assert ta.floor_to_tick(ask) <= ask
+
+
 def test_avg_fill_price_weights_by_quantity():
     order = {"orderActivityCollection": [
         {"activityType": "EXECUTION", "executionLegs": [
@@ -157,6 +167,48 @@ def test_build_option_sell_order_coverage_guard():
         ta.build_option_sell_order(ticker="AAPL", strike=200,
                                    expiration="2026-01-16", limit=3.0,
                                    quantity=3, option_type="C", max_contracts=2)
+
+
+def test_build_option_sell_order_coverage_guard_names_the_numbers():
+    # The message is the user's only feedback that an over-cover size was
+    # rejected — the widget no longer clamps it (Streamlit's own clamp silently
+    # kept the last valid value, which armed Place for a size never typed).
+    with pytest.raises(ValueError, match="5 contracts exceeds the 4"):
+        ta.build_option_sell_order(ticker="CPNG", strike=30,
+                                   expiration="2026-09-18", limit=1.0,
+                                   quantity=5, option_type="C",
+                                   max_contracts=4)
+
+
+# ── close_input_error: the closing screens' equivalent of the order builder ───
+
+def test_close_input_error_accepts_a_usable_close():
+    assert ta.close_input_error(1.25, 2, 4) is None
+    assert ta.close_input_error(1.25, 4, 4) is None      # all of it
+
+
+def test_close_input_error_rejects_more_than_held():
+    msg = ta.close_input_error(1.25, 5, 4)
+    assert msg and "4 contract(s)" in msg and "5" in msg
+
+
+def test_close_input_error_rejects_nonpositive_limit():
+    assert "positive" in ta.close_input_error(0.0, 1, 4)
+    assert "positive" in ta.close_input_error(-0.5, 1, 4)
+
+
+def test_close_input_error_rejects_zero_contracts():
+    assert "at least 1" in ta.close_input_error(1.25, 0, 4)
+
+
+def test_close_input_error_rejects_emptied_inputs():
+    # st.number_input returns None when its box is cleared.
+    for limit, n in ((None, 2), (1.25, None), (None, None)):
+        assert ta.close_input_error(limit, n, 4) is not None
+
+
+def test_close_input_error_rejects_unusable_types():
+    assert ta.close_input_error("abc", 2, 4) is not None
 
 
 def test_calls_coverable_nets_existing_short_calls():
@@ -344,6 +396,22 @@ def test_place_put_close_order_rejects_invalid():
                                    expiration="2026-07-17", limit=0.0,
                                    quantity=1, account_hash="HASH")
     assert res["ok"] is False and c.placed is None
+
+
+def test_place_option_close_order_long_submits_sell_to_close():
+    # A long leg (direction="long") closes with SELL_TO_CLOSE, not buy-to-close.
+    c = _FakeClient(place=_Resp(201, loc=".../orders/78"))
+    res = ta.place_option_close_order(c, ticker="AMD", strike=100.0,
+                                      expiration="2026-07-17", limit=3.20,
+                                      quantity=1, account_hash="HASH",
+                                      option_type="C", direction="long")
+    assert res["ok"] is True
+    sent_hash, spec = c.placed
+    assert sent_hash == "HASH"
+    leg = spec.build()["orderLegCollection"][0]
+    assert leg["instruction"] == "SELL_TO_CLOSE"
+    assert leg["instrument"]["symbol"] == "AMD   260717C00100000"
+    assert leg["quantity"] == 1
 
 
 def test_get_order_status_parses_and_flags_cancelable():

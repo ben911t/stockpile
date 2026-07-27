@@ -60,6 +60,7 @@ def build_option_row(
     theta: float = 0.0,
     vega: float = 0.0,
     last_trade_days: float = float("nan"),
+    last_trade_ms: float = 0.0,
 ) -> dict | None:
     """Apply quote-quality filters and assemble a canonical chain row.
 
@@ -118,6 +119,9 @@ def build_option_row(
         # Days since the contract last traded (NaN when the provider
         # doesn't say) — feeds the fresh_quotes surface filter.
         "last_trade_days": last_trade_days,
+        # Epoch-ms of the last print (0 when the provider doesn't say) — feeds
+        # the pre-confirm "Last @ time" annotation, not the surface fit.
+        "last_trade_ms": last_trade_ms,
         "earnings_count": 0,
         "hv_20":          float("nan"),
         "vr_ratio":       float("nan"),

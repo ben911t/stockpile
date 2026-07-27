@@ -26,8 +26,10 @@ except Exception:  # pragma: no cover - shields against Streamlit layout drift
     def get_script_run_ctx():
         return None
 
-from options_scanner import trade_actions, trades_store
-from options_scanner.ui_theme import metric_card, section_header
+from options_scanner import (
+    confirm_gate, positions_cache, settings_ui, trade_actions, trades_store,
+)
+from options_scanner.ui_theme import df_height, metric_card, section_header
 
 # Max wall-clock the Trades tab waits for all per-trade Schwab reads (order
 # status + cost-to-close re-quote), which run in parallel. A slower or hung
@@ -50,6 +52,76 @@ def _kv_table_html(rows: "list[tuple[str, str]]") -> str:
             f"{cells}</table>")
 
 
+def _fmt_spot_day(spot, pct):
+    """``(spot_text, pct_text, is_up)`` for a spot + day-change readout, or None
+    when spot is unusable (missing, NaN, non-positive, unparseable).
+
+    One formatting rule, two renderers (`_day_head_px` for HTML, `_day_head_md`
+    for markdown), so the collapsed row header and the chart header can't
+    disagree. Matches the Spot cell and the Spot/Day% table columns ($x.xx,
+    ±x.x%), and `is_up` matches `_day_chart`'s `last >= open` test so a flat
+    session isn't red text under a green line. `pct_text` is "" when the change
+    is unknown.
+    """
+    try:
+        spot = float(spot)
+    except (TypeError, ValueError):
+        return None
+    if not (spot == spot and spot > 0):  # NaN or nonsense
+        return None
+    pct_text, is_up = "", True
+    try:
+        pct = float(pct)
+        if pct == pct:
+            pct_text, is_up = f"{pct:+.1f}%", pct >= 0
+    except (TypeError, ValueError):
+        pass
+    return f"${spot:,.2f}", pct_text, is_up
+
+
+def _day_head_px(spot, pct) -> str:
+    """The price segment of the day-chart header, as HTML. Empty string when spot
+    is unknown — better a bare "TODAY · TICKER" than a dash pretending to be a
+    quote.
+
+    The quote AND the change are colored together, green up / red down, matching
+    the chart line: color here means one thing only — which way the underlying is
+    today. With no change available there's no direction to state, so the price
+    stays plain rather than defaulting to green.
+    """
+    parts = _fmt_spot_day(spot, pct)
+    if parts is None:
+        return ""
+    spot_text, pct_text, is_up = parts
+    body = f"{spot_text} {pct_text}".strip()
+    style = ("font-size:0.82rem;font-weight:600;"
+             "font-variant-numeric:tabular-nums;")
+    if pct_text:
+        style += f"color:{'#16a34a' if is_up else '#dc2626'};"
+    return f"<span style='{style}'>{body}</span>"
+
+
+def _day_head_md(spot, pct) -> str:
+    """The same readout as markdown, for the collapsed row header — a
+    ``st.button`` label renders markdown, not HTML.
+
+    Quote + change colored as one unit via Streamlit's ``:green[…]`` /
+    ``:red[…]`` directives (theme-aware, unlike a hex). The word "spot" stays
+    plain: it's a label, and labels on that line carry no color. Dollar signs are
+    backslash-escaped because a *pair* of them anywhere in a markdown string is
+    read as LaTeX math — the strike earlier in the header supplies the other one.
+    Empty string when spot is unknown, so the caller can drop the segment.
+    """
+    parts = _fmt_spot_day(spot, pct)
+    if parts is None:
+        return ""
+    spot_text, pct_text, is_up = parts
+    body = f"{spot_text} {pct_text}".strip().replace("$", "\\$")
+    if not pct_text:
+        return f"spot {body}"
+    return f"spot " + (f":green[{body}]" if is_up else f":red[{body}]")
+
+
 def _day_chart(series: "list | None"):
     """A small, minimal intraday line for the trade's ticker — green up / red
     down on the session, with a faint dashed line at the open. Returns an Altair
@@ -63,14 +135,25 @@ def _day_chart(series: "list | None"):
     import pandas as pd
     from datetime import datetime, timezone
 
+    # Convert each bar to the viewer's local time, then drop tzinfo so Altair
+    # renders the value verbatim (no browser re-offset) — the axis/tooltip then
+    # read as market-local clock time instead of UTC.
+    def _local(ts):
+        return (datetime.fromtimestamp(ts, tz=timezone.utc)
+                .astimezone().replace(tzinfo=None))
+
     df = pd.DataFrame({
-        "t": [datetime.fromtimestamp(ts, tz=timezone.utc) for ts, _ in series],
+        "t": [_local(ts) for ts, _ in series],
         "price": [px for _, px in series],
     })
     open_px, last_px = series[0][1], series[-1][1]
     color = "#16a34a" if last_px >= open_px else "#dc2626"
     line = alt.Chart(df).mark_line(color=color, strokeWidth=1.7).encode(
-        x=alt.X("t:T", axis=None),
+        # Sparse HH:MM ticks so the line has a time reference without cluttering
+        # this small chart (was axis=None → no time shown at all).
+        x=alt.X("t:T", axis=alt.Axis(title=None, format="%H:%M", labelFontSize=9,
+                                     tickCount=4, grid=False, domain=False,
+                                     ticks=False, labelColor="#9ca3af")),
         y=alt.Y("price:Q", scale=alt.Scale(zero=False),
                 axis=alt.Axis(title=None, labelFontSize=9, tickCount=3,
                               grid=False, domain=False, ticks=False)),
@@ -229,6 +312,118 @@ def _book_close(trade: dict, closed_n: int, close_cost, closed_at: str) -> None:
                         close_qty=None)
 
 
+def _settle_closing_trade(t: dict, cbs: "dict | None") -> "tuple[bool, str|None]":
+    """Settle a trade sitting in "closing" against its polled broker status.
+
+    Returns ``(changed, note)`` — `changed` True when the store was updated (the
+    caller should refresh/rerun), `note` a one-time message when the order ended
+    without fully filling. A still-working order, or an unavailable status,
+    leaves the trade alone → ``(False, None)``.
+
+    Pure store mutation: it deliberately touches no session_state, so the two
+    callers can surface the note where each needs it (per-row on the Trades tab,
+    top-of-tab for the on-load reconciliation). Shared so a fill or an expiry
+    settles identically wherever it's first noticed."""
+    if not cbs:
+        return False, None
+    qty = int(t.get("quantity", 1))
+    _lim = t.get("close_limit_px")
+    _cqty = int(t.get("close_qty") or qty)
+    _cstat = cbs.get("status")
+
+    def _at(v):
+        return (v.isoformat() if v
+                else datetime.now().isoformat(timespec="seconds"))
+
+    def _cost():
+        _px = cbs.get("fill_price")
+        return round(_px, 2) if _px is not None else _lim
+
+    if _cstat == "FILLED":
+        _book_close(t, int(cbs.get("filled") or _cqty), _cost(),
+                    _at(cbs.get("filled_at")))
+        return True, None
+    if cbs.get("cancelable"):
+        return False, None            # still working at the broker
+    # Terminal but not FILLED → the buy-to-close never (fully) executed: a day
+    # order that EXPIRED at the close, or was CANCELED/REJECTED at the broker.
+    # Don't leave the trade stuck in "closing" — book any filled contracts and
+    # return the rest to a normal open position.
+    _filled_n = int(float(cbs.get("filled") or 0))
+    _external = t.get("opened_from") == "schwab_position"
+    if _filled_n > 0:
+        # Partial fill then terminal: book the filled contracts (a split, like a
+        # partial close).
+        _book_close(t, _filled_n, _cost(), _at(cbs.get("filled_at")))
+        if _external:
+            # The remainder isn't app-tracked (it lives at the broker) — drop
+            # it, don't leave a phantom open trade.
+            trades_store.remove(t["id"])
+            return True, (f"Closing order {_cstat} after filling {_filled_n} of "
+                          f"{qty} — the rest stays open at your broker (see the "
+                          "**Close** tab).")
+        return True, (f"Closing order {_cstat} after filling {_filled_n} of "
+                      f"{qty} — the rest is open again.")
+    if _external:
+        trades_store.remove(t["id"])
+        return True, (f"Closing order {_cstat} without filling — the position is "
+                      "unchanged at your broker (see the **Close** tab).")
+    trades_store.update(t["id"], status="open", close_order_id=None,
+                        close_limit_px=None, close_qty=None)
+    return True, (f"Closing order {_cstat} without filling — the position is "
+                  "open again; place a new closing order when ready.")
+
+
+def _reconcile_closing_orders(scfg: dict) -> bool:
+    """Poll every tracked working closing order and settle the ones that already
+    resolved at the broker. Returns True when anything changed.
+
+    Run on load by BOTH the Trades and Close tabs. Without it a closing order
+    that expired overnight stayed "closing" in the store until the user happened
+    to expand that specific row on the Trades tab (the per-trade Schwab reads are
+    deferred behind row expansion) — which left the Close tab refusing to place a
+    new close, insisting an order was "already working", for an order that had
+    been dead since the previous session's close.
+
+    Cheap enough to run unconditionally: only trades actually sitting in
+    "closing" are polled (usually none or a couple), and `_order_status` is
+    cached 15s — unlike the per-trade quote/chart prefetch that made deferring
+    worthwhile in the first place. Paper trades never reach a broker, so they're
+    skipped."""
+    if not scfg.get("app_key"):
+        return False
+    pending = [t for t in trades_store.load()
+               if t.get("status") == "closing" and t.get("close_order_id")
+               and not t.get("paper")]
+    if not pending:
+        return False
+    ak, sk = scfg.get("app_key", ""), scfg.get("app_secret", "")
+    cb, tf = scfg.get("callback_url", ""), scfg.get("token_file", "")
+    changed = False
+    for t in pending:
+        _chg, _note = _settle_closing_trade(
+            t, _order_status(ak, sk, cb, tf, t.get("close_order_id"),
+                             (t.get("account") or "")[-4:]))
+        if not _chg:
+            continue
+        changed = True
+        # Stash for top-of-tab display: the record may have been removed
+        # entirely, so a per-row note would have nowhere to render.
+        if _note:
+            st.session_state.setdefault("_close_reconcile_notes", []).append(
+                _note)
+        st.session_state.pop(f"close_result_{t['id']}", None)
+    if changed:
+        _order_status.clear()
+    return changed
+
+
+def _render_reconcile_notes() -> None:
+    """Show (once) any notes left by the on-load closing-order reconciliation."""
+    for _n in st.session_state.pop("_close_reconcile_notes", []):
+        st.info(_n)
+
+
 def _submit_close(scfg: dict, trade: dict, limit: float, live: bool,
                   close_qty: int | None = None) -> dict:
     """Close a tracked put. `live` True → send a real BUY_TO_CLOSE order;
@@ -250,10 +445,12 @@ def _submit_close(scfg: dict, trade: dict, limit: float, live: bool,
                     "msg": ("Live position can't be closed in paper mode — set "
                             "paper=false in config.toml and restart.")}
         _book_close(trade, close_qty, round(float(limit), 2), now)
+        # Toast format: headline first, then ONE sentence per line (run_app
+        # renders each following line as its own bullet).
         return {"ok": True,
-                "msg": (f"Close recorded in the tracker ({close_qty}{_of} "
-                        f"contract(s), debit ${debit:,.0f}). No live order "
-                        "sent.")}
+                "msg": (f"📝 Close recorded in the tracker\n"
+                        f"{close_qty}{_of} contract(s), debit ${debit:,.0f}.\n"
+                        "No live order was sent.")}
     try:
         client = get_client(scfg.get("app_key", ""), scfg.get("app_secret", ""),
                             scfg.get("callback_url", ""),
@@ -283,11 +480,14 @@ def _submit_close(scfg: dict, trade: dict, limit: float, live: bool,
                         close_limit_px=round(float(limit), 2),
                         close_qty=close_qty)
     _oid = f" (id {res['order_id']})" if res["order_id"] else ""
+    # Toast format: headline first, then ONE sentence per line (run_app renders
+    # each following line as its own bullet).
     return {"ok": True,
-            "msg": (f"✅ LIVE closing order sent to {mask}{_oid} ({close_qty}"
-                    f"{_of} contract(s)). It will show as **closing** here "
-                    "until it fills — cancel it from this tab if needed. Verify "
-                    "at your broker.")}
+            "msg": (f"✅ LIVE closing order sent to {mask}{_oid}\n"
+                    f"Buying back {close_qty}{_of} contract(s).\n"
+                    "It shows as closing until it fills.\n"
+                    "Cancel it from this tab if you change your mind.\n"
+                    "Verify at your broker.")}
 
 
 def _cancel_close_order(scfg: dict, trade: dict) -> dict:
@@ -313,14 +513,581 @@ def _cancel_close_order(scfg: dict, trade: dict) -> dict:
             "msg": "✅ Closing order canceled — the position is open again."}
 
 
+# ── Close Options section (live Schwab) — its own "Close" tab ─────────────────
+
+# Cached (60s) read-only reader for every live option leg — it lives in
+# positions_cache so the Roll tab and the ⚙️ Settings dialog share one cache and
+# one Schwab round-trip. Aliased here so existing `_option_positions(...)` calls
+# and `_option_positions.clear()` keep working (clearing the alias clears the
+# shared cache, which is what 🔄 should do).
+_option_positions = positions_cache.option_positions
+
+
+def _tracked_open_leg(underlying: str, option_type: str, strike: float,
+                      expiration: str) -> dict | None:
+    """The still-open/closing tracked trade matching a held leg, or None — so a
+    Schwab position can be tagged 'tracked' and its close routed through the
+    tracked flow instead of a standalone order (no tracker desync)."""
+    for t in trades_store.load():
+        if t.get("status") not in ("open", "closing"):
+            continue
+        if (str(t.get("ticker", "")).upper() == str(underlying).upper()
+                and str(t.get("option_type", "P")).upper()
+                    == str(option_type).upper()
+                and str(t.get("expiration", "")) == str(expiration)
+                and abs(float(t.get("strike", 0) or 0) - float(strike)) < 1e-6):
+            return t
+    return None
+
+
+def _submit_position_close(scfg: dict, pos: dict, limit: float,
+                           close_qty: int) -> dict:
+    """Submit a LIVE close for an *untracked* Schwab option leg. Short →
+    BUY_TO_CLOSE, long → SELL_TO_CLOSE (per pos['direction']). Returns {ok, msg}.
+
+    For a SHORT leg the close is also logged to the Trades store as a "closing"
+    record (marked ``opened_from="schwab_position"``) so it shows in the Trades
+    section and finalizes to "closed" with realized P/L once the buy-to-close
+    fills — using the broker's open average price as the credit. A LONG leg is
+    NOT logged: the Trades P/L model is credit-received (short premium), so a
+    long's realized P/L would come out inverted; its order still goes out."""
+    from stocks_shared.schwab_live import get_client
+    qty = int(pos.get("quantity", 1))
+    close_qty = max(1, min(int(close_qty), qty))
+    try:
+        client = get_client(scfg.get("app_key", ""), scfg.get("app_secret", ""),
+                            scfg.get("callback_url", ""),
+                            scfg.get("token_file", ""))
+    except Exception as exc:
+        return {"ok": False, "msg": f"Schwab unreachable: {exc}"}
+    resolved = trade_actions.resolve_account_hash(client, None)
+    if not resolved:
+        return {"ok": False,
+                "msg": "Couldn't resolve the account — close NOT sent."}
+    account_hash, mask = resolved
+    direction = pos.get("direction", "short")
+    res = trade_actions.place_option_close_order(
+        client, ticker=pos.get("underlying", ""),
+        strike=float(pos.get("strike", 0)), expiration=pos.get("expiration", ""),
+        limit=float(limit), quantity=close_qty, account_hash=account_hash,
+        option_type=pos.get("option_type", "P"), direction=direction)
+    if not res["ok"]:
+        return {"ok": False, "msg": f"Close rejected: {res['error']}"}
+    _action = "SELL TO CLOSE" if direction == "long" else "BUY TO CLOSE"
+    _of = f" of {qty}" if close_qty < qty else ""
+    _oid = f" (id {res['order_id']})" if res["order_id"] else ""
+    if direction != "long":
+        # Log as a "closing" record so the Trades section polls the order and
+        # finalizes it to "closed" (with realized P/L) on fill. `opened_from`
+        # marks it broker-sourced so an UNFILLED close is dropped, not adopted
+        # as a phantom open trade (the leg lives at the broker, not the app).
+        trades_store.add({
+            "ticker": pos.get("underlying", ""),
+            "strike": float(pos.get("strike", 0)),
+            "expiration": pos.get("expiration", ""),
+            "option_type": pos.get("option_type", "P"),
+            "quantity": close_qty,
+            "credit": round(float(pos.get("avg_price", 0)), 2),
+            "status": "closing",
+            "close_order_id": res["order_id"],
+            "close_limit_px": round(float(limit), 2),
+            "close_qty": close_qty,
+            "account": mask,
+            "paper": False,
+            "opened_from": "schwab_position",
+        })
+        _extra = "It appears on the Trades tab and finalizes once filled."
+    else:
+        _extra = "Long closes aren't logged to the Trades tab."
+    # Toast format: headline first, then ONE sentence per line (run_app renders
+    # each following line as its own bullet).
+    return {"ok": True,
+            "msg": (f"✅ LIVE {_action} sent to {mask}{_oid}\n"
+                    f"Closing {close_qty}{_of} contract(s).\n"
+                    f"{_extra}\n"
+                    "Verify at your broker.")}
+
+
+def _scroll_into_view() -> None:
+    """Scroll the just-opened close builder into view after a position select.
+    Same technique as the Roll tab: Streamlit strips injected anchor ids, so the
+    component scrolls its own iframe (window.frameElement) into view."""
+    st.iframe(
+        """
+        <script>
+        (function() {
+          const el = window.frameElement;
+          if (!el) return;
+          window.parent.setTimeout(function() {
+            el.style.scrollMarginTop = "100px";
+            el.scrollIntoView({behavior: "smooth", block: "start"});
+          }, 150);
+        })();
+        </script>
+        """,
+        height=1, width=1,
+    )
+
+
+def _render_option_close(pos: dict, scfg: dict, market_open,
+                         config_paper: bool, spot: float | None = None) -> None:
+    """Close builder for one selected Schwab option leg: re-quote, editable
+    limit + contracts (partial close), LIVE + market-hours gate, 2-step confirm.
+    A tracked leg routes through _submit_close (so it shows 'closing' up top); an
+    untracked leg uses _submit_position_close.
+
+    `spot` is the underlying's live price, passed down from the caller's already-
+    fetched spot map (None when unavailable) so the quote line can lead with it
+    without a second fetch."""
+    tkr = str(pos.get("underlying", ""))
+    opt = str(pos.get("option_type", "P"))
+    strike = float(pos.get("strike", 0))
+    exp = str(pos.get("expiration", ""))
+    qty = int(pos.get("quantity", 1))
+    direction = pos.get("direction", "short")
+    is_long = direction == "long"
+    _word = "SELL TO CLOSE" if is_long else "BUY TO CLOSE"
+    _right = "Call" if opt == "C" else "Put"
+    tracked = _tracked_open_leg(tkr, opt, strike, exp)
+    posid = f"{tkr}_{opt}_{strike:g}_{exp}"
+
+    st.markdown(f"**Close {tkr} ${strike:g} {_right} {exp}** — {direction} "
+                f"×{qty}" + ("  ·  tracked on the Trades tab" if tracked
+                             else ""))
+
+    # A working close already exists for this leg → don't offer a second one
+    # (that would place a duplicate order); point to where it's tracked. The
+    # status was re-checked against the broker on tab load
+    # (_reconcile_closing_orders), so a filled/expired order has already been
+    # settled — but say so, since an unreachable Schwab leaves it unverified and
+    # the user would otherwise have no way to tell a stale block from a real one.
+    if tracked and tracked.get("status") == "closing":
+        st.info("⏳ A closing order is already working for this position — "
+                "track it on the **Trades** tab. If you expect it to have "
+                "filled or expired, hit 🔄 above to re-check with Schwab.")
+        return
+
+    # Live-only: these are real broker positions.
+    if config_paper:
+        st.warning("🔴 These are **live** broker positions. Closing needs "
+                   "`paper = false` in config.toml (then restart). In paper "
+                   "mode this section is view-only.")
+        return
+
+    # Re-quote for a suggested limit (reuses the tracked-trade cache).
+    q = _close_quote(scfg.get("app_key", ""), scfg.get("app_secret", ""),
+                     scfg.get("callback_url", ""), scfg.get("token_file", ""),
+                     tkr, exp, strike, opt)
+    mid = q.get("mid") if q else None
+    default_lim = trade_actions.round_to_tick(mid) if mid else 0.05
+    _seed_key, _wid_key = f"opt_close_seed_{posid}", f"opt_close_limit_{posid}"
+    if st.session_state.get(_seed_key) != default_lim:
+        st.session_state[_wid_key] = float(default_lim)
+        st.session_state[_seed_key] = default_lim
+
+    # No min_value/max_value on either input: Streamlit won't commit an
+    # out-of-range entry — it keeps the last valid value and shows its own
+    # message — which would arm Place for a number the user never typed. Both
+    # are validated by trade_actions.close_input_error below.
+    _il, _iq, _ = st.columns([1.3, 1, 2], vertical_alignment="center")
+    with _il:
+        limit = st.number_input(
+            f"{_word} limit ($/share)",
+            step=float(trade_actions.tick_for(default_lim)), format="%.2f",
+            key=_wid_key)
+    # Re-seeded only when the held size changes — clamping on every rerun would
+    # swallow an over-max entry before it could be reported (see reseed_on_change).
+    _qk = f"opt_close_qty_{posid}"
+    confirm_gate.reseed_on_change(_qk, f"opt_close_qty_seed_{posid}", qty)
+    with _iq:
+        # Left uncast — an emptied box returns None, and int(None) would raise
+        # before the validity check below can report it.
+        close_n = st.number_input(
+            f"Contracts (of {qty})", step=1,
+            format="%d", key=_qk, disabled=(qty == 1))
+    if q:
+        # Bold + full-strength (st.markdown, not the muted st.caption) so the
+        # live quote reads at a glance while setting the limit. Spot leads; the
+        # last print trails with its ET timestamp (regular weight — it's
+        # metadata) so a stale print is obvious. Unavailable segments are
+        # dropped rather than shown as a dash, keeping the line short.
+        _qp = []
+        if spot is not None and spot == spot and float(spot) > 0:  # not NaN
+            _qp.append(f"**Spot \\${float(spot):,.2f}**")
+        _qp += [f"**Bid \\${q.get('bid', 0):.2f}**",
+                f"**Ask \\${q.get('ask', 0):.2f}**",
+                f"**Mid \\${(q.get('mid') or 0):.2f}**"]
+        _last_px = float(q.get("last") or 0)
+        if _last_px > 0:
+            _lt = trade_actions.fmt_last_trade_et(q.get("last_trade_ms"))
+            _qp.append(f"**Last \\${_last_px:.2f}**"
+                       + (f" ({_lt})" if _lt else ""))
+        st.markdown("  ·  ".join(_qp))
+    else:
+        st.caption("Re-quote unavailable — set your own limit.")
+
+    _confirm_key = f"opt_close_confirm_{posid}"
+    _result_key = f"opt_close_result_{posid}"
+    _result = st.session_state.get(_result_key)
+    _val_keys = (_wid_key, _qk)
+    _input_err = trade_actions.close_input_error(limit, close_n, qty)
+    _valid = _input_err is None
+    if _valid:
+        limit, close_n = float(limit), int(close_n)
+    else:
+        st.error(_input_err)
+    _blocked = (None if market_open is True else
+                ("Equity options trade 9:30–16:00 ET, Mon–Fri."
+                 if market_open is False else "Can't confirm market hours."))
+    # Two-step, matching the tracked-trade close: "Confirm Close" arms the
+    # confirm panel below; the actual LIVE order is the "Place Close" button
+    # there. Nothing is sent on this first click, and editing the limit or the
+    # contract count afterwards disarms it (see confirm_gate).
+    _armed = confirm_gate.armed(_confirm_key, _val_keys, valid=_valid)
+
+    def _close_error(limit_v, n_v):
+        return trade_actions.close_input_error(limit_v, n_v, qty)
+
+    _bc, _ = st.columns([2, 3])
+    with _bc:
+        # An invalid limit/size does NOT disable this button — it stays clickable
+        # so a correction can be confirmed in one click (the click commits the
+        # field, then the callback re-validates). Only the market-hours gate,
+        # which editing can't fix, disables it.
+        if _blocked:
+            st.button("Confirm Close · 🔴 LIVE", disabled=True,
+                      key=f"opt_close_btn_{posid}", help=_blocked,
+                      width="stretch", type="primary")
+            if market_open is False:
+                st.caption("⏸ Market closed")
+        elif _armed:
+            st.button("Confirm Close · 🔴 LIVE", disabled=True,
+                      key=f"opt_close_btn_{posid}", type="primary",
+                      help=confirm_gate.ARMED_HELP, width="stretch")
+        else:
+            st.button("Confirm Close · 🔴 LIVE", key=f"opt_close_btn_{posid}",
+                      type="primary", width="stretch",
+                      on_click=confirm_gate.arm(_confirm_key, _val_keys,
+                                                clear_keys=(_result_key,),
+                                                validate=_close_error))
+
+    if _armed:
+        _val = limit * 100 * close_n
+        _verb = "credit" if is_long else "debit"
+        _of = f" of {qty}" if close_n < qty else ""
+        st.warning((f"**Confirm** — {_word} {close_n}{_of} {tkr} ${strike:g} "
+                    f"{_right.upper()} @ ${limit:.2f} ({_verb} "
+                    f"**${_val:,.0f}**) · 🔴 **LIVE**").replace("$", "\\$"))
+
+        _cc1, _cc2, _ = st.columns([1, 1, 3])
+        with _cc1:
+            _do = st.button("Place Close · 🔴 LIVE",
+                            key=f"opt_close_do_{posid}", type="primary",
+                            width="stretch")
+        with _cc2:
+            _cbox = st.container(key=f"opt_close_cxlbox_{posid}")
+            _cbox.button("Cancel", key=f"opt_close_cxl_{posid}",
+                         width="stretch",
+                         on_click=confirm_gate.disarm(_confirm_key))
+        if _do:
+            _result = (_submit_close(scfg, tracked, limit, True, close_n)
+                       if tracked else
+                       _submit_position_close(scfg, pos, limit, close_n))
+            st.session_state[_result_key] = _result
+            st.session_state[_confirm_key] = False
+            if _result.get("ok"):
+                # Confirm via the center banner (like the Sell Put / Roll
+                # dialogs) rather than the inline st.success below: this panel
+                # renders only while a position row is selected, and a close
+                # drops that position out of the refetched list — so the inline
+                # message had nowhere to render and the confirmation was never
+                # seen. Drop the stored result so it can't double-render.
+                st.session_state["_osc_toast"] = _result["msg"]
+                st.session_state.pop(_result_key, None)
+                _option_positions.clear()
+                _close_quote.clear()
+                _order_status.clear()
+            # Rerun either way: disarming above only lands on the NEXT run, so
+            # without this the panel the click came from stays up with Place
+            # Close still live. On a failure the stored result re-renders as the
+            # inline error below, one Confirm away from a retry.
+            st.rerun()
+    # Failures stay inline, next to the button that produced them (a success
+    # leaves via the banner above).
+    if _result and not _result.get("ok"):
+        st.error(_result["msg"].replace("$", "\\$"))
+
+
+def _pos_pkey(p: dict) -> tuple:
+    """Stable identity for an option leg — keys the prefetched-quote map."""
+    return (p.get("underlying", ""), p.get("option_type", "P"),
+            float(p.get("strike", 0)), p.get("expiration", ""))
+
+
+def _prefetch_position_quotes(positions: list, scfg: dict) -> dict:
+    """Parallel per-leg re-quotes → {pkey: quote|None}, so the positions table
+    shows each leg's live delta without N sequential round-trips. Reuses the
+    cached `_close_quote`; a slow/hung leg leaves that entry None (delta blank)
+    rather than blocking the tab. Mirrors the Roll tab's _prefetch_quotes — can't
+    import it (rolls imports from this module → circular)."""
+    if not positions:
+        return {}
+    ak, sk = scfg.get("app_key", ""), scfg.get("app_secret", "")
+    cb, tf = scfg.get("callback_url", ""), scfg.get("token_file", "")
+
+    def _job(p):
+        return _close_quote(ak, sk, cb, tf, p.get("underlying", ""),
+                            p.get("expiration", ""), float(p.get("strike", 0)),
+                            p.get("option_type", "P"))
+
+    out: dict = {}
+    ctx = get_script_run_ctx()
+    init = (functools.partial(add_script_run_ctx, ctx=ctx)
+            if add_script_run_ctx is not None else None)
+    ex = concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, len(positions)), initializer=init)
+    futs = {ex.submit(_job, p): _pos_pkey(p) for p in positions}
+    deadline = time.monotonic() + _TRADES_FETCH_TIMEOUT_S
+    for fut, k in futs.items():
+        try:
+            out[k] = fut.result(timeout=max(0.0, deadline - time.monotonic()))
+        except Exception:
+            out[k] = None
+    ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+def _sign_color(v) -> str:
+    """Green for positive, red for negative — colors the Spot/Day% cell.
+    st.dataframe honors a pandas Styler's concrete-hex color (CSS vars don't
+    resolve in the grid renderer)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if f > 0:
+        return "color: #16a34a"
+    if f < 0:
+        return "color: #dc2626"
+    return ""
+
+
 @st.fragment
-def tab_trades() -> None:
-    # A fragment so widget edits rerun just this tab. Explicit Cancel / Remove /
-    # close actions call a full st.rerun() — never scope="fragment", which is
-    # illegal during a full script run — and that's safe now because run_app's
-    # tab selector preserves the active tab across a full rerun (no snap to tab 0).
+def _render_option_positions(scfg: dict, provider: str, market_open) -> None:
+    """The 'Close Options (Schwab)' section (the "Close" tab): list every live
+    option leg (with live delta, remaining-time-value Ann%, and the underlying's
+    spot / day change) and let the user close all or part of one."""
+    import pandas as pd
+    from options_scanner.display.spot_meta import fetch_spot_meta
+
+    _hdr, _rf = st.columns([8, 1], vertical_alignment="bottom")
+    with _hdr:
+        section_header(title="Close Options (Schwab)")
+    with _rf:
+        if st.button("🔄", key="opt_pos_refresh",
+                     help="Re-fetch positions, quotes, order status, and spot."):
+            _option_positions.clear()
+            _close_quote.clear()
+            _order_status.clear()
+            fetch_spot_meta.clear()
+
+    if provider != "schwab" or not scfg.get("app_key"):
+        st.info("Connect Schwab and select it as the data source (top bar) to "
+                "see and manage your live option positions here.")
+        return
+    # Settle any closing order that already resolved at the broker BEFORE the
+    # per-leg "a close is already working" guard reads the store — otherwise an
+    # order that expired overnight keeps blocking a fresh close.
+    _reconcile_closing_orders(scfg)
+    _render_reconcile_notes()
+    positions = _option_positions(scfg.get("app_key", ""),
+                                  scfg.get("app_secret", ""),
+                                  scfg.get("callback_url", ""),
+                                  scfg.get("token_file", ""))
+    if positions is None:
+        st.warning("Couldn't reach Schwab — your token may have expired. "
+                   "Re-run `schwab_auth.py`, then hit 🔄.")
+        return
+    if not positions:
+        st.caption("No option positions in your Schwab account.")
+        return
+    # Hidden-position blacklist (⚙️ Settings), applied here rather than inside
+    # the cached reader: the cache keeps the account's truth, and a settings
+    # change lands on the next rerun instead of waiting out the 60s TTL.
+    _held_n = len(positions)
+    positions, _hidden = settings_ui.filter_hidden(positions, scope="close")
+    if not positions:
+        st.caption(f"All {_held_n} of your option positions are hidden by your "
+                   f"⚙️ Settings — nothing to show.")
+        # Still render the notice: it carries the toggle that reveals them.
+        settings_ui.render_hidden_notice(_hidden, scope="close")
+        return
+
+    config_paper = bool(scfg.get("paper", True))
+    positions = sorted(positions, key=lambda p: (str(p.get("underlying", "")),
+                                                 str(p.get("expiration", "")),
+                                                 float(p.get("strike", 0))))
+    _today = datetime.now().date()
+
+    def _dte(e):
+        try:
+            return (datetime.strptime(e, "%Y-%m-%d").date() - _today).days
+        except Exception:
+            return None
+
+    # Live delta per leg (parallel) + one spot/day fetch per unique underlying.
+    quotes = _prefetch_position_quotes(positions, scfg)
+    meta: dict = {}
+    for _tk in {str(p.get("underlying", "")) for p in positions}:
+        try:
+            meta[_tk] = fetch_spot_meta(_tk, provider)
+        except Exception:
+            meta[_tk] = {}
+
+    def _spot_day(tk):
+        m = meta.get(tk) or {}
+        spot, pct = m.get("spot"), m.get("pct_change")
+        if not (spot is not None and spot == spot and float(spot) > 0):  # NaN
+            return "—", None
+        s = f"${float(spot):,.2f}"
+        if pct is not None:
+            s += f"  {float(pct):+.1f}%"
+        return s, (float(pct) if pct is not None else None)
+
+    rows = []
+    for p in positions:
+        _opt = p.get("option_type", "P")
+        _dir = str(p.get("direction", "")).lower()
+        _tkr = str(p.get("underlying", ""))
+        _strike = float(p.get("strike", 0))
+        _qty = int(p.get("quantity", 1))
+        _mv = float(p.get("market_value", 0) or 0)
+        _mark = abs(_mv) / (100 * _qty) if _qty else None
+        _dte_v = _dte(p.get("expiration", ""))
+        _spot_v = (meta.get(_tkr) or {}).get("spot")
+        _spot = (float(_spot_v) if (_spot_v is not None and _spot_v == _spot_v
+                                    and float(_spot_v) > 0) else None)
+        # Annualized % of the remaining time value (extrinsic): time value =
+        # mark − intrinsic; annualized against strike (puts) or spot (calls),
+        # matching the scanner's Ann% convention.
+        _ann = None
+        if _mark is not None and _spot is not None and _dte_v and _dte_v > 0:
+            _intrinsic = (max(0.0, _spot - _strike) if _opt == "C"
+                          else max(0.0, _strike - _spot))
+            _tv = max(0.0, _mark - _intrinsic)
+            _base = _spot if _opt == "C" else _strike
+            if _base > 0:
+                _ann = _tv / _base * (365.0 / _dte_v) * 100.0
+        _delta = (quotes.get(_pos_pkey(p)) or {}).get("delta")
+        _tracked = _tracked_open_leg(_tkr, _opt, _strike,
+                                     p.get("expiration", "")) is not None
+        _tags = ([("covered" if p.get("covered") else "naked")]
+                 if _opt == "C" and _dir == "short" else [])
+        if _tracked:
+            _tags.append("tracked")
+        _spotday, _pct = _spot_day(_tkr)
+        rows.append({
+            "Ticker": _tkr,
+            "Spot/Day%": _spotday,
+            "_pct": _pct,
+            "Type": f"{'Call' if _opt == 'C' else 'Put'} - "
+                    f"{'Short' if _dir == 'short' else 'Long'}",
+            "Strike": _strike,
+            "Exp": p.get("expiration", ""),
+            "DTE": _dte_v,
+            "Qty": _qty,
+            "Delta": (round(_delta, 2) if _delta is not None else None),
+            "Ann%": (round(_ann, 1) if _ann is not None else None),
+            "Avg": round(float(p.get("avg_price", 0)), 2),
+            "Mkt Val": round(_mv, 0),
+            "Note": " · ".join(_tags),
+        })
+    disp = pd.DataFrame(rows)
+    st.caption("🔍 **Select a position** to close all or part of it. To roll an "
+               "existing position instead, use the **Roll** tab.")
+    st.caption("view-only in paper mode." if config_paper
+               else "**🔴 LIVE** (buy-to-close for short legs, sell-to-close "
+                    "for long).")
+    styled = disp.style.apply(
+        lambda s: [_sign_color(disp.loc[i, "_pct"]) for i in s.index],
+        subset=["Spot/Day%"])
+    event = st.dataframe(
+        styled, hide_index=True, width="stretch", on_select="rerun",
+        selection_mode="single-row", key="opt_pos_table",
+        height=df_height(styled),
+        column_config={
+            "Spot/Day%": st.column_config.TextColumn(
+                "Spot/Day%", width=130,
+                help="Underlying spot and today's change (green up / red down)."),
+            "_pct": None,
+            "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
+            "Delta": st.column_config.NumberColumn("Delta", format="%.2f"),
+            "Ann%": st.column_config.NumberColumn(
+                "Ann%", format="%.1f%%",
+                help="Annualized return on the option's remaining time value "
+                     "(extrinsic) — puts vs strike, calls vs spot. Low = little "
+                     "premium left to decay, a cue to close."),
+            "Avg": st.column_config.NumberColumn("Avg", format="$%.2f"),
+            "Mkt Val": st.column_config.NumberColumn("Mkt Val", format="$%.0f"),
+            "DTE": st.column_config.NumberColumn("DTE", format="%d"),
+        })
+    sel = event.selection.rows if hasattr(event, "selection") else []
+    if sel:
+        if st.session_state.get("_opt_pos_scroll") != sel[0]:
+            st.session_state["_opt_pos_scroll"] = sel[0]
+            _scroll_into_view()
+        st.markdown("---")
+        # Reuse the spot already fetched for the table above (same cached
+        # source), so the close panel's quote line can't disagree with the row.
+        _sel_pos = positions[sel[0]]
+        _sel_spot = (meta.get(str(_sel_pos.get("underlying", ""))) or {}).get(
+            "spot")
+        _render_option_close(_sel_pos, scfg, market_open, config_paper,
+                             _sel_spot)
+        st.markdown("---")
+    else:
+        st.session_state.pop("_opt_pos_scroll", None)
+
+    # Hidden-position note last, so it never pushes the table down.
+    settings_ui.render_hidden_notice(_hidden, scope="close")
+
+
+def _trades_context() -> tuple:
+    """Per-render context shared by the Trades and Close tabs:
+    (provider, scfg, market_open). market_open (None = unknown → fail safe) gates
+    live closing; it's one cached (60s) Schwab read."""
     provider = st.session_state.get("data_source", "yahoo")
     scfg = st.session_state.get("schwab_config") or {}
+    market_open = (_market_open(scfg.get("app_key", ""),
+                                scfg.get("app_secret", ""),
+                                scfg.get("callback_url", ""),
+                                scfg.get("token_file", ""))
+                   if (provider == "schwab" and scfg.get("app_key")) else None)
+    return provider, scfg, market_open
+
+
+def tab_trades() -> None:
+    # The "Trades" tab: the scanner-trades list only. Managing live Schwab option
+    # positions moved to its own "Close" tab (tab_close). _scanner_trades is a
+    # fragment, so a trade-row toggle or the 🔄 reruns just this list, not the app.
+    provider, scfg, market_open = _trades_context()
+    _scanner_trades(provider, scfg, market_open)
+
+
+def tab_close() -> None:
+    # The "Close" tab: the Close Options (Schwab) section — list live option legs
+    # and close all or part of one. _render_option_positions is a fragment, so
+    # its 🔄 and row-select rerun just this section.
+    provider, scfg, market_open = _trades_context()
+    _render_option_positions(scfg, provider, market_open)
+
+
+@st.fragment
+def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
+    # A fragment so trade-row toggles and the 🔄 rerun just this list. The toggle
+    # uses st.rerun(scope="fragment") (legal — we're always inside this fragment);
+    # explicit Cancel / Remove / close actions keep a full st.rerun(), and run_app
+    # preserves the active tab across it.
     # Current order mode (config `paper` flag) as a badge beside the Trades
     # title, so it's obvious at a glance — on first load too — whether placing
     # or closing a trade goes live or is simulated.
@@ -331,18 +1098,18 @@ def tab_trades() -> None:
         + ("background:#334155;color:#cbd5e1;'>📝 PAPER</span>"
            if _paper_mode else
            "background:#b91c1c;color:#fff;'>🔴 LIVE</span>"))
-    # Market-hours gate for live closing (None = unknown → fail safe).
-    market_open = (_market_open(scfg.get("app_key", ""),
-                                scfg.get("app_secret", ""),
-                                scfg.get("callback_url", ""),
-                                scfg.get("token_file", ""))
-                   if (provider == "schwab" and scfg.get("app_key")) else None)
+
+    # Settle any closing order that already resolved at the broker before the
+    # list is read, so a trade whose close expired overnight shows as open again
+    # on arrival — the per-row Schwab reads below are deferred behind row
+    # expansion, so without this it stayed "closing" until the user drilled in.
+    _reconcile_closing_orders(scfg)
 
     # "rolling" trades are in-flight net-price rolls managed on the Roll tab —
     # they surface here as normal open positions only once they fill.
     trades = [t for t in trades_store.load() if t.get("status") != "rolling"]
     if not trades:
-        section_header(title=f"Trades{_mode_badge}")
+        section_header(title=f"Trades made from Scanner{_mode_badge}")
         st.info(
             "No trades yet. Put-sells you place from the **Watchlist** "
             "leaderboard's *Sell Put* dialog appear here with live P/L and a "
@@ -360,7 +1127,7 @@ def tab_trades() -> None:
               f"open</span>")
     _th, _tr = st.columns([8, 1], vertical_alignment="bottom")
     with _th:
-        section_header(title=f"Trades{_mode_badge}{_count}")
+        section_header(title=f"Trades made from Scanner{_mode_badge}{_count}")
     with _tr:
         if st.button("🔄", key="trades_refresh",
                      help="Re-fetch order status, quotes, and spot."):
@@ -368,6 +1135,11 @@ def tab_trades() -> None:
             _close_quote.clear()
             from options_scanner.display.spot_meta import fetch_spot_meta
             fetch_spot_meta.clear()
+
+    # Notes from the reconciliation above (e.g. "closing order EXPIRED without
+    # filling"), shown once at the top — the record may have been removed, so a
+    # per-row note could have nowhere to land.
+    _render_reconcile_notes()
 
     # Per-trade styling, scoped to keyed containers: a stronger border on the
     # close-limit field (like the Sell Put dialog), and red Remove buttons
@@ -382,6 +1154,50 @@ def tab_trades() -> None:
         "[class*='st-key-rm_box_'] button:hover{background-color:#c9302c "
         "!important;border-color:#c9302c !important;}"
         "[class*='st-key-rm_box_'] button p{color:#fff !important;}"
+        # Lazy-row header buttons: left-aligned, full-width, subtle border —
+        # reads like the expander rows they replace, not a primary button.
+        "[class*='st-key-trade_hdr_'] button{background:transparent "
+        "!important;border:1px solid rgba(148,163,184,0.25) !important;}"
+        "[class*='st-key-trade_hdr_'] button:hover{"
+        "background:rgba(148,163,184,0.08) !important;"
+        "border-color:rgba(148,163,184,0.45) !important;}"
+        # Pin the header text to the plain ink color, in every state. The theme's
+        # generic `.stButton > button:hover {color: var(--osc-primary)}` repaints
+        # ALL of a button's text on hover, which turned a whole header row —
+        # ticker, strike, expiry, size, status — accent-colored just from mousing
+        # over it. On this row color is reserved for one meaning: whether the
+        # underlying is up or down today. These rules don't touch the spot
+        # segment's own <span>, so its green/red survives.
+        "[class*='st-key-trade_hdr_'] button,"
+        "[class*='st-key-trade_hdr_'] button:hover,"
+        "[class*='st-key-trade_hdr_'] button:active,"
+        "[class*='st-key-trade_hdr_'] button:focus{"
+        "color:var(--osc-ink-2) !important;}"
+        "[class*='st-key-trade_hdr_'] button p,"
+        "[class*='st-key-trade_hdr_'] button:hover p{"
+        "color:var(--osc-ink-2) !important;}"
+        # Quick-remove 🗑 at the right end of each header row: borderless and
+        # muted so it reads as an icon rather than a second button competing with
+        # the row toggle, and unmistakably destructive (red tint) on hover.
+        "[class*='st-key-rm_quick_'] button{background:transparent !important;"
+        "border:1px solid transparent !important;opacity:0.55;"
+        "padding-left:0 !important;padding-right:0 !important;}"
+        "[class*='st-key-rm_quick_'] button:hover{opacity:1;"
+        "background:rgba(217,83,79,0.12) !important;"
+        "border-color:rgba(217,83,79,0.45) !important;}"
+        # The flex that centers the label sits on the button AND its inner
+        # content wrapper (ButtonContentWithIcon) — push BOTH to flex-start, and
+        # let the label's markdown container fill the row so text-align:left
+        # actually bites. Targeting only the <button> left the inner div
+        # centering the text.
+        "[class*='st-key-trade_hdr_'] button,"
+        "[class*='st-key-trade_hdr_'] button>div{justify-content:flex-start "
+        "!important;text-align:left !important;}"
+        "[class*='st-key-trade_hdr_'] button div[data-testid="
+        "'stMarkdownContainer']{width:100% !important;text-align:left "
+        "!important;}"
+        "[class*='st-key-trade_hdr_'] button p{width:100% !important;"
+        "text-align:left !important;font-weight:600 !important;}"
         "</style>",
         unsafe_allow_html=True,
     )
@@ -395,6 +1211,7 @@ def tab_trades() -> None:
     close_status_by_id: dict = {}
     quote_by_id: dict = {}
     chart_by_ticker: dict = {}   # ticker -> intraday series for the day chart
+    spot_by_ticker: dict = {}    # ticker -> {spot, pct_change} for the headers
     if provider == "schwab" and scfg.get("app_key"):
         _ak, _as = scfg.get("app_key", ""), scfg.get("app_secret", "")
         _cb, _tf = scfg.get("callback_url", ""), scfg.get("token_file", "")
@@ -416,9 +1233,35 @@ def tab_trades() -> None:
         def _chart_job(tr):
             return _intraday(_ak, _as, _cb, _tf, tr.get("ticker"))
 
+        def _spot_job(tr):
+            from options_scanner.display.spot_meta import fetch_spot_meta
+            try:
+                return fetch_spot_meta(str(tr.get("ticker", "")), provider)
+            except Exception:
+                return None
+
         jobs = []  # (kind, key, trade) — key is trade_id, or ticker for charts
         _chart_seen = set()
+        _spot_seen = set()
         for tr in trades:
+            # Spot + day change for the COLLAPSED header, so an open position
+            # shows its underlying's price without being expanded. The one read
+            # here that ISN'T deferred — the header is on screen before any row
+            # opens — but it's one cached fetch (60s TTL) per unique underlying,
+            # in this same parallel batch, and only for a position that's still
+            # open. A closed record's exposure is gone, so today's quote would be
+            # noise; it isn't fetched and the header omits the segment.
+            _stk = tr.get("ticker")
+            if (_stk and _stk not in _spot_seen
+                    and tr.get("status") in ("open", "closing")):
+                _spot_seen.add(_stk)
+                jobs.append(("spot", _stk, tr))
+            # Deferred load: a collapsed trade fetches nothing else. Its Schwab
+            # reads run only once the user opens its row (the toggle header below
+            # sets this flag, then reruns so this loop picks the trade up). Tab
+            # load starts with every row collapsed → no per-trade round-trips.
+            if not st.session_state.get(f"trade_open_{tr.get('id')}", False):
+                continue
             # Opening-order status only matters while the trade is still open;
             # a working closing order is polled via close_order_id instead.
             if (not tr.get("paper") and tr.get("order_id")
@@ -445,11 +1288,13 @@ def tab_trades() -> None:
             _job_fns = {"status": _status_job,
                         "close_status": _close_status_job,
                         "quote": _quote_job,
-                        "chart": _chart_job}
+                        "chart": _chart_job,
+                        "spot": _spot_job}
             _job_maps = {"status": status_by_id,
                          "close_status": close_status_by_id,
                          "quote": quote_by_id,
-                         "chart": chart_by_ticker}
+                         "chart": chart_by_ticker,
+                         "spot": spot_by_ticker}
             fut_map = {}
             for kind, tid, tr in jobs:
                 fut_map[ex.submit(_job_fns[kind], tr)] = (kind, tid)
@@ -491,11 +1336,58 @@ def tab_trades() -> None:
         _disp_status = ((bs.get("status") or _store_status).lower()
                         if _store_status == "open" and bs else _store_status)
         _otw = "CALL" if t.get("option_type") == "C" else "PUT"
-        label = (f"{t.get('ticker', '?')} ${t.get('strike', '?')} {_otw} — "
+        # Underlying spot + today's change, just before the mode badge — which
+        # stays the last element on every line. Absent for a closed record (no
+        # live exposure, and no fetch was made) or when the quote didn't come
+        # back, in which case the segment is simply dropped.
+        _hmeta = spot_by_ticker.get(t.get("ticker")) or {}
+        _spot_seg = _day_head_md(_hmeta.get("spot"), _hmeta.get("pct_change"))
+        # The strike's "$" is escaped: two unescaped dollar signs in one markdown
+        # string (strike + spot) get parsed as LaTeX math, which swallows them
+        # and reflows the middle of the header into a serif math run.
+        label = (f"{t.get('ticker', '?')} \\${t.get('strike', '?')} {_otw} — "
                  f"{exp_disp} · {qty}x · {_disp_status}"
+                 + (f" · {_spot_seg}" if _spot_seg else "")
                  + ("  ·  📝 PAPER" if t.get("paper") else "  ·  🔴 LIVE"))
 
-        with st.expander(label, expanded=False):
+        # Lazy row (replaces st.expander): a collapsed trade renders only this
+        # header and fetches nothing — its Schwab reads were skipped in the
+        # prefetch above. Clicking toggles open/closed. An expander can't gate
+        # the fetch because collapse/expand is client-side and never reruns the
+        # script; a header button does, so on open the prefetch re-runs and
+        # picks this trade up.
+        _exp_key = f"trade_open_{t['id']}"
+        is_open = st.session_state.get(_exp_key, False)
+        _chev = "▼" if is_open else "▶"
+        # Header row: the toggle spans the width, with a 🗑 at the far right (past
+        # the PAPER/LIVE badge) so a record can be dropped without expanding it.
+        # Same action as the in-row "Remove from Tracker" — it deletes the app's
+        # record only and never touches a broker position.
+        _hdr_c, _trash_c = st.columns([22, 1], vertical_alignment="center")
+        with _hdr_c:
+            if st.button(f"{_chev}  {label}", key=f"trade_hdr_{t['id']}",
+                         width="stretch"):
+                st.session_state[_exp_key] = not is_open
+                # Fragment-scoped: opening a row reruns only this trades fragment
+                # (so the prefetch picks the row up) and leaves the Close Options
+                # fragment below untouched.
+                st.rerun(scope="fragment")
+        with _trash_c:
+            if st.button("🗑", key=f"rm_quick_{t['id']}", width="stretch",
+                         help=f"Remove {t.get('ticker', '?')} "
+                              f"${t.get('strike', '?')} {_otw} from the tracker "
+                              f"— deletes this record only; a broker position is "
+                              f"untouched."):
+                trades_store.remove(t["id"])
+                # Full rerun (not scope="fragment"): the list has to be re-read
+                # from the store, and the banner is rendered by run_app.
+                st.session_state["_osc_toast"] = (
+                    f"🗑 Removed {t.get('ticker', '?')} "
+                    f"${t.get('strike', '?')} {_otw} from the tracker\n"
+                    "This deleted the app's record only — any broker position is "
+                    "untouched.")
+                st.rerun()
+        if is_open:
             # Live re-quote for cost-to-close (Schwab, read-only) — fetched in
             # the parallel prefetch above; None when unavailable or timed out.
             q = quote_by_id.get(t.get("id"))
@@ -576,20 +1468,37 @@ def tab_trades() -> None:
                     ("Ann%", f"{_ann:.1f}%" if _ann is not None else "—"),
                 ]
                 # Spot cell: live value, plus the fill-time spot once captured.
-                if _spot is not None:
-                    _spot_cell = f"${_spot:,.2f}"
-                    if _spct is not None:
-                        _spot_cell += f", {_spct:+.1f}%"
-                else:
+                # Colored by today's direction, same rule as the row header and
+                # the chart caption — the same number shouldn't be green in one
+                # place and plain in another. The fill-time suffix below stays
+                # muted: it's history, not today's move.
+                _sd = _fmt_spot_day(_spot, _spct)
+                if _sd is None:
                     _spot_cell = "—"
+                else:
+                    _s_txt, _p_txt, _s_up = _sd
+                    _spot_cell = f"{_s_txt}, {_p_txt}" if _p_txt else _s_txt
+                    if _p_txt:
+                        _spot_cell = (
+                            f"<span style='color:"
+                            f"{'#16a34a' if _s_up else '#dc2626'}'>"
+                            f"{_spot_cell}</span>")
                 if t.get("fill_spot") is not None:
                     _spot_cell += ("<span style='color:#94a3b8'> · fill "
                                    f"${float(t['fill_spot']):,.2f}</span>")
+                # Last cell carries the print time (New York) on its own line
+                # beneath the price when Schwab supplied it, so a stale last is
+                # obvious while setting the close limit.
+                _last_cell = f"${float(q.get('last', 0)):,.2f}"
+                _lt = trade_actions.fmt_last_trade_et(q.get("last_trade_ms"))
+                if _lt:
+                    _last_cell += (f"<br><span style='color:#94a3b8'>{_lt}"
+                                   "</span>")
                 _prices = [
                     ("Bid", f"${float(q.get('bid', 0)):,.2f}"),
                     ("Ask", f"${float(q.get('ask', 0)):,.2f}"),
                     ("Mid", f"${float(q.get('mid', 0)):,.2f}"),
-                    ("Last", f"${float(q.get('last', 0)):,.2f}"),
+                    ("Last", _last_cell),
                     ("OI", f"{q.get('open_interest', 0):,}"),
                     ("Vol", f"{q.get('volume', 0):,}"),
                     ("Spot", _spot_cell),
@@ -743,11 +1652,23 @@ def tab_trades() -> None:
                     # the right column (just under UNREALIZED P/L / STATUS).
                     _chart = _day_chart(chart_by_ticker.get(t.get("ticker")))
                     _box = st.container(border=True)
+                    # Header: the "TODAY · TICKER" eyebrow on the left, spot and
+                    # today's change right-aligned on the same line — so the
+                    # number the line is drawing is readable without hunting for
+                    # the Spot row in the details table. `_spot`/`_spct` come from
+                    # the fetch above (same _has_snapshot branch, no extra call);
+                    # the price segment is dropped entirely when spot is
+                    # unavailable rather than showing a dash next to the eyebrow.
+                    # Green/red match the chart line and the Spot/Day% columns.
                     _box.markdown(
-                        "<div style='font-size:0.62rem;font-weight:700;"
+                        "<div style='display:flex;align-items:baseline;"
+                        "justify-content:space-between;gap:8px;'>"
+                        "<span style='font-size:0.62rem;font-weight:700;"
                         "letter-spacing:0.09em;color:#94a3b8;"
-                        f"text-transform:uppercase;'>Today · {t.get('ticker', '')}"
-                        "</div>", unsafe_allow_html=True)
+                        f"text-transform:uppercase;'>Today · "
+                        f"{t.get('ticker', '')}</span>"
+                        f"{_day_head_px(_spot, _spct)}</div>",
+                        unsafe_allow_html=True)
                     if _chart is not None:
                         _box.altair_chart(_chart, use_container_width=True)
                     else:
@@ -767,55 +1688,19 @@ def tab_trades() -> None:
                 _lim_txt = f" @ ${_lim:.2f}" if _lim else ""
                 _cqty = int(t.get("close_qty") or qty)
                 _qty_txt = f" ({_cqty} of {qty})" if _cqty < qty else ""
-                if cbs and cbs.get("status") == "FILLED":
-                    # Book the close — full → mark closed; partial → split off a
-                    # closed record and keep the remainder open — at the true
-                    # average execution price (falling back to the limit), then
-                    # rerun to render the result cleanly.
-                    _cat = cbs.get("filled_at")
-                    _fill_px = cbs.get("fill_price")
-                    _cost = round(_fill_px, 2) if _fill_px is not None else _lim
-                    _book_close(t, int(cbs.get("filled") or _cqty), _cost,
-                                (_cat.isoformat() if _cat
-                                 else datetime.now().isoformat(
-                                     timespec="seconds")))
-                    st.rerun()
-                _cstat = cbs.get("status") if cbs else None
-                _close_working = bool(cbs and cbs.get("cancelable"))
-                # Terminal but not FILLED → the buy-to-close never (fully)
-                # executed (a day order that EXPIRED at the close, or was
-                # CANCELED/REJECTED at the broker). Don't leave the trade stuck
-                # in "closing": book any filled contracts and return the rest to
-                # a normal open position automatically, with a one-time note.
-                if cbs and not _close_working and _cstat != "FILLED":
-                    _filled_n = int(float(cbs.get("filled") or 0))
-                    if _filled_n > 0:
-                        # Partial fill then terminal: book the filled contracts
-                        # and keep the remainder open (a split, like a partial
-                        # close).
-                        _fill_px = cbs.get("fill_price")
-                        _cost = (round(_fill_px, 2) if _fill_px is not None
-                                 else _lim)
-                        _cat = cbs.get("filled_at")
-                        _book_close(t, _filled_n, _cost,
-                                    (_cat.isoformat() if _cat
-                                     else datetime.now().isoformat(
-                                         timespec="seconds")))
-                        _note = (f"Closing order {_cstat} after filling "
-                                 f"{_filled_n} of {qty} — the rest is open "
-                                 "again.")
-                    else:
-                        # Nothing filled — revert the whole position to open.
-                        trades_store.update(t["id"], status="open",
-                                            close_order_id=None,
-                                            close_limit_px=None, close_qty=None)
-                        _note = (f"Closing order {_cstat} without filling — the "
-                                 "position is open again; place a new closing "
-                                 "order when ready.")
-                    st.session_state[f"close_note_{t['id']}"] = _note
+                # Fill / expiry handling lives in _settle_closing_trade, shared
+                # with the on-load reconciliation both tabs run — so a closing
+                # order settles the same way whether it's noticed here or on the
+                # Close tab. A note means it ended without fully filling.
+                _chg, _note = _settle_closing_trade(t, cbs)
+                if _chg:
+                    if _note:
+                        st.session_state[f"close_note_{t['id']}"] = _note
                     st.session_state.pop(f"close_result_{t['id']}", None)
                     _order_status.clear()
                     st.rerun()
+                _cstat = cbs.get("status") if cbs else None
+                _close_working = bool(cbs and cbs.get("cancelable"))
 
                 if _cstat:
                     st.caption(f"⏳ Closing order **{_cstat}**{_qty_txt}{_lim_txt}"
@@ -857,34 +1742,31 @@ def tab_trades() -> None:
             # Broker-order status now renders up in the details column (see
             # _broker_status_line, above the card layout).
 
-            # While unfilled → Cancel (a live working order, or a paper sim that
-            # never reaches a broker). Place Closing Trade appears only once the
-            # order is confirmed FILLED.
-            _cancel_branch = (t.get("status") == "open"
-                              and (working or is_paper))
-            _close_branch = (t.get("status") == "open" and filled)
+            # A live order that hasn't filled yet → Cancel; it isn't a position
+            # so there's nothing to close. Once it's FILLED the close controls
+            # take over.
+            #
+            # A PAPER trade goes straight to the close controls: there is no
+            # broker order to reach FILLED, so gating on `filled` (as this once
+            # did) made a simulated close unreachable even though the whole path
+            # exists — `_submit_close(live=False)` records it in the tracker with
+            # realized P/L. Its discard button moves down there alongside them,
+            # since discarding a trade you never took isn't the same outcome as
+            # closing it.
+            _cancel_branch = (t.get("status") == "open" and working)
+            _close_branch = (t.get("status") == "open"
+                             and (filled or is_paper))
             if _cancel_branch:
                 _crk = f"cancel_result_{t['id']}"
-                _clabel = ("Cancel working order" if working
-                           else "Cancel (discard paper trade)")
-                _chelp = ("Cancels the unfilled order at the broker — no "
-                          "position changes." if working
-                          else "Discards this simulated trade.")
                 # Equal-width, adjacent on the left (spacer column on the right).
                 _ac1, _ac2, _ = st.columns([2, 2, 3])
                 with _ac1:
-                    if st.button(_clabel, key=f"cancel_ord_{t['id']}",
-                                 help=_chelp, width="stretch"):
-                        if working:
-                            st.session_state[_crk] = _cancel_order(scfg, t)
-                            _order_status.clear()
-                        else:  # paper — no broker order, discard the record
-                            trades_store.update(
-                                t["id"], status="canceled",
-                                canceled_at=datetime.now().isoformat(
-                                    timespec="seconds"))
-                            st.session_state[_crk] = {
-                                "ok": True, "msg": "Paper trade canceled."}
+                    if st.button("Cancel working order",
+                                 key=f"cancel_ord_{t['id']}",
+                                 help="Cancels the unfilled order at the broker "
+                                      "— no position changes.", width="stretch"):
+                        st.session_state[_crk] = _cancel_order(scfg, t)
+                        _order_status.clear()
                         # Re-run the fragment so the status reflects it now.
                         st.rerun()
                 with _ac2:
@@ -934,31 +1816,67 @@ def tab_trades() -> None:
                 with _il:
                     st.markdown("Close limit")
                 with _if:
+                    # No min_value/max_value here or on Contracts: Streamlit
+                    # won't commit an out-of-range entry (it keeps the last valid
+                    # value and shows its own message), which would arm Place for
+                    # a number the user never typed. Validated by
+                    # trade_actions.close_input_error below.
                     _clbox = st.container(key=f"close_box_{t['id']}")
                     close_limit = _clbox.number_input(
                         "Close limit",
-                        min_value=float(trade_actions.tick_for(default_close)),
                         step=float(trade_actions.tick_for(default_close)),
                         format="%.2f", key=_wid_key,
                         label_visibility="collapsed",
                     )
-                # Seed via session_state (and re-clamp if a prior partial close
-                # shrank the position below the remembered count) so the keyed
-                # widget doesn't error on a stale over-max value.
+                # Default to the whole position, re-seeded only when the position
+                # size itself changes (e.g. a prior partial close shrank it). The
+                # old version clamped any value above `qty` on every rerun, which
+                # ate the user's own over-max entry on the same rerun the Confirm
+                # click caused — the field snapped back to the max with no error.
                 _qk = f"close_qty_{t['id']}"
-                if st.session_state.get(_qk) is None or \
-                        st.session_state[_qk] > qty:
-                    st.session_state[_qk] = qty
+                confirm_gate.reseed_on_change(_qk, f"close_qty_seed_{t['id']}",
+                                              qty)
                 with _ql:
                     st.markdown(f"Contracts (of {qty})")
                 with _qf:
-                    close_n = int(st.number_input(
-                        "Contracts", min_value=1, max_value=qty, step=1,
+                    # Left uncast — an emptied box returns None, and int(None)
+                    # would raise before the validity check below can report it.
+                    close_n = st.number_input(
+                        "Contracts", step=1,
                         format="%d", key=_qk, label_visibility="collapsed",
-                        disabled=(qty == 1)))
+                        disabled=(qty == 1))
 
-                _bc, _rc, _ = st.columns([2, 2, 1], vertical_alignment="center")
+                # Editing the limit or the contract count after confirming
+                # disarms Place (confirm_gate), so the panel below can only ever
+                # describe the numbers Confirm was actually pressed on.
+                _val_keys = (_wid_key, _qk)
+                _input_err = trade_actions.close_input_error(
+                    close_limit, close_n, qty)
+                _valid = _input_err is None
+                _armed = confirm_gate.armed(_confirm_key, _val_keys,
+                                            valid=_valid)
+                if _valid:
+                    close_limit, close_n = float(close_limit), int(close_n)
+                else:
+                    st.error(_input_err)
+                def _close_error(limit_v, n_v, _held=qty):
+                    return trade_actions.close_input_error(limit_v, n_v, _held)
+
+                # A paper trade gets a third action: discard it outright. Closing
+                # books a realized P/L as though the trade ran its course, which
+                # is the wrong record for a simulation you've decided against.
+                if is_paper:
+                    _bc, _dc, _rc, _ = st.columns(
+                        [2, 2, 2, 1], vertical_alignment="center")
+                else:
+                    _bc, _rc, _ = st.columns([2, 2, 1],
+                                             vertical_alignment="center")
+                    _dc = None
                 with _bc:
+                    # An invalid limit/size does NOT disable Confirm — it stays
+                    # clickable so a correction lands in one click (the click
+                    # commits the field, then the callback re-validates). Only
+                    # blocks editing can't fix (paper mode, market hours) disable.
                     if _live_in_paper:
                         _blocked = ("Live position — set paper=false in "
                                     "config.toml to send a closing order.")
@@ -972,18 +1890,43 @@ def tab_trades() -> None:
                         st.button(f"Confirm Closing Trade · {_close_badge}", disabled=True,
                                   key=f"close_btn_{t['id']}", help=_blocked,
                                   width="stretch", type="primary")
-                    elif st.button(f"Confirm Closing Trade · {_close_badge}",
-                                   key=f"close_btn_{t['id']}", width="stretch",
-                                   type="primary"):
-                        st.session_state[_confirm_key] = True
-                        st.session_state.pop(_result_key, None)
+                    elif _armed:
+                        st.button(f"Confirm Closing Trade · {_close_badge}",
+                                  disabled=True, key=f"close_btn_{t['id']}",
+                                  help=confirm_gate.ARMED_HELP,
+                                  width="stretch", type="primary")
+                    else:
+                        st.button(f"Confirm Closing Trade · {_close_badge}",
+                                  key=f"close_btn_{t['id']}", width="stretch",
+                                  type="primary",
+                                  on_click=confirm_gate.arm(
+                                      _confirm_key, _val_keys,
+                                      clear_keys=(_result_key,),
+                                      validate=_close_error))
+                if _dc is not None:
+                    with _dc:
+                        if st.button("Cancel (discard paper trade)",
+                                     key=f"cancel_ord_{t['id']}", width="stretch",
+                                     help="Marks this simulated trade canceled — "
+                                          "it was never placed, so it isn't a "
+                                          "close and books no P/L."):
+                            trades_store.update(
+                                t["id"], status="canceled",
+                                canceled_at=datetime.now().isoformat(
+                                    timespec="seconds"))
+                            # Toast, not an inline message: canceling moves the
+                            # record out of this branch, so anything rendered
+                            # here would have nowhere to land after the rerun.
+                            st.session_state["_osc_toast"] = (
+                                "📝 Paper trade canceled — no close was booked.")
+                            st.rerun()
                 with _rc:
                     _rmbox = st.container(key=f"rm_box_{t['id']}")
                     _rmbox.button("Remove from Tracker", key=f"rm_{t['id']}",
                                   on_click=trades_store.remove,
                                   args=(t["id"],), width="stretch")
 
-                if st.session_state.get(_confirm_key):
+                if _armed:
                     _debit = close_limit * 100 * close_n
                     _of2 = f" of {qty}" if close_n < qty else ""
                     _otw2 = "CALL" if t.get("option_type") == "C" else "PUT"
@@ -1010,9 +1953,6 @@ def tab_trades() -> None:
                     )
                     # Collapse via on_click (runs before the rerun body) so
                     # Cancel takes effect on the first click, like Sell Put.
-                    def _cancel_close(_k=_confirm_key):
-                        st.session_state[_k] = False
-
                     bc1, bc2, _ = st.columns([1, 1, 3])
                     with bc1:
                         _do = st.button(f"Place Closing Trade · {_close_badge}",
@@ -1021,17 +1961,26 @@ def tab_trades() -> None:
                     with bc2:
                         _cbox = st.container(key=_cancel_box_key)
                         _cbox.button("Cancel", key=f"close_cancel_{t['id']}",
-                                     width="stretch", on_click=_cancel_close)
+                                     width="stretch",
+                                     on_click=confirm_gate.disarm(_confirm_key))
                     if _do:
                         _result = _submit_close(scfg, t, close_limit, close_live,
                                                 close_n)
                         st.session_state[_result_key] = _result
                         st.session_state[_confirm_key] = False
-                        # A live close moves the trade to "closing" — rerun so it
-                        # re-renders with the working-status + Cancel UI instead
-                        # of the (now stale) close panel.
-                        if _result.get("ok") and close_live:
-                            st.rerun()
+                        if _result.get("ok"):
+                            # Confirm via the center banner, and DROP the stored
+                            # result so it can't also render inline below (one
+                            # placement, one message).
+                            st.session_state["_osc_toast"] = _result["msg"]
+                            st.session_state.pop(_result_key, None)
+                        # Rerun either way. Disarming above only takes effect on
+                        # the NEXT run, so without this the panel the click came
+                        # from stays on screen with Place Closing Trade still
+                        # live — the paper path used to skip the rerun and did
+                        # exactly that. A full rerun (not scope="fragment") is
+                        # required: run_app renders the banner.
+                        st.rerun()
 
                 if _result:
                     (st.success if _result.get("ok") else st.error)(

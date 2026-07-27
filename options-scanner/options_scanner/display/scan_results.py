@@ -19,7 +19,7 @@ import streamlit as st
 
 from options_scanner import iv_scores
 from options_scanner.format import EARNINGS_WARN_LEGEND, fmt_strike
-from options_scanner.ui_theme import empty_state
+from options_scanner.ui_theme import df_height, empty_state
 
 from options_scanner.display.chain_styling import (
     SPREAD_HELP,
@@ -172,7 +172,7 @@ def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
 
     if investigate is None:
         st.dataframe(styled, column_config=col_cfg, hide_index=True,
-                     width="stretch")
+                     width="stretch", height=df_height(styled))
         if _has_warn:
             st.caption(EARNINGS_WARN_LEGEND)
         stamp_caption()
@@ -189,7 +189,8 @@ def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
     _key = f"{investigate['key_prefix']}_{opt_type}"
     event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
                          width="stretch", on_select="rerun",
-                         selection_mode="single-row", key=_key)
+                         selection_mode="single-row", key=_key,
+                         height=df_height(styled))
     if _has_warn:
         st.caption(EARNINGS_WARN_LEGEND)
     stamp_caption()

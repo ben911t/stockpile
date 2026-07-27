@@ -25,11 +25,14 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
-from options_scanner import trade_actions, trades_store
+from options_scanner import (
+    confirm_gate, positions_cache, settings_ui, trade_actions, trades_store,
+)
 from options_scanner.fetch import fetch_and_enrich
 from options_scanner.format import fmt_strike
 from options_scanner.ui_theme import (
-    empty_state, metric_card, render_schwab_reauth_hint, section_header,
+    df_height, empty_state, metric_card, render_schwab_reauth_hint,
+    section_header,
 )
 # Reuse the Trades tab's cached read-only Schwab helpers + threading context
 # rather than re-implementing them (same pattern the leaderboard uses).
@@ -101,18 +104,10 @@ def _opened_days_map(positions: list) -> dict:
     return out
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def _rollable(app_key: str, app_secret: str, callback_url: str,
-              token_file: str) -> list | None:
-    """Cached (60s) read-only rollable positions (short covered calls + short
-    puts) from the live Schwab account. None when the client can't be built
-    (→ re-auth hint); a list (possibly empty) otherwise."""
-    from stocks_shared.schwab_live import get_client
-    try:
-        client = get_client(app_key, app_secret, callback_url, token_file)
-    except Exception:
-        return None
-    return trade_actions.rollable_positions(client)
+# Cached (60s) read-only rollable positions (short covered calls + short puts),
+# shared with the Close tab and the ⚙️ Settings dialog via positions_cache.
+# Aliased so `_rollable(...)` and `_rollable.clear()` read the same as before.
+_rollable = positions_cache.rollable
 
 
 def _dte(expiration: str) -> int | None:
@@ -176,10 +171,15 @@ def _submit_roll(scfg: dict, roll: "trade_actions.RollOrder", close_mid: float,
         "close_cost_est": round(close_mid, 2), "account": mask,
     })
     _oid = f" (id {res['order_id']})" if res["order_id"] else ""
+    # Toast format: headline first, then ONE sentence per line (run_app renders
+    # each following line as its own bullet).
     return {"ok": True,
-            "msg": (f"✅ LIVE roll sent to {mask}{_oid} — {roll.describe()}. "
-                    "Shows as **rolling** here until it fills, then appears as "
-                    "an open position on the Trades tab. Verify at your broker.")}
+            "msg": (f"✅ LIVE roll sent to {mask}{_oid}\n"
+                    f"{roll.describe()}.\n"
+                    "Both legs fill together as one net-price order.\n"
+                    "It shows as rolling on this tab until it fills.\n"
+                    "Once filled, the new leg appears on the Trades tab.\n"
+                    "Verify at your broker.")}
 
 
 def _cancel_roll(scfg: dict, t: dict) -> dict:
@@ -406,11 +406,17 @@ def _scroll_into_view() -> None:
     )
 
 
+@st.fragment
 def _render_roll_detail(pos: dict, scfg: dict, market_open, config_paper: bool,
                         provider: str) -> None:
     """The roll builder for one selected position: close-leg snapshot, a
     filtered target scan (NetCr column), then per-leg snapshots + a net-price
-    confirm step."""
+    confirm step.
+
+    Its own fragment (nested inside ``tab_rolls``) so editing a filter reruns
+    only this section — the position tables above keep their live quotes, spot
+    reads and scroll position instead of re-rendering on every keystroke commit.
+    Explicit place/cancel actions still call a full ``st.rerun()``."""
     ticker = pos["underlying"]
     otype = pos["option_type"]        # "C" / "P"
     side = "call" if otype == "C" else "put"
@@ -463,6 +469,7 @@ def _render_roll_detail(pos: dict, scfg: dict, market_open, config_paper: bool,
                                key=f"roll_delta_{posid}")
 
     # Second filter row: strike range (each empty = unbounded) + net-credit-only.
+    # Changing a filter no longer rescans on its own — the Scan button below does.
     g1, g2, g3, _ = st.columns([1, 1, 1.4, 1.6], vertical_alignment="bottom")
     with g1:
         _mins = st.number_input("Min Strike", min_value=0.0, value=None,
@@ -477,37 +484,71 @@ def _render_roll_detail(pos: dict, scfg: dict, market_open, config_paper: bool,
             "Net credit only", value=False, key=f"roll_netcredit_{posid}",
             help="Only targets whose new premium ≥ cost to close the current "
                  "leg (a net-credit roll).")
+    # Gate the (network) target scan behind the Scan button (its own row below
+    # the filters, left of the pre-scan hint): run it only when Scan is clicked,
+    # then stash the filtered/sorted target set so plain reruns (a filter tweak,
+    # a row selection) re-render it without re-scanning. Each scan bumps a
+    # generation counter so the results table starts with no stale row selected
+    # (the table's widget key includes it).
+    _scan_key = f"roll_scan_result_{posid}"
+    _bcol, _tcol = st.columns([2, 5], vertical_alignment="center")
+    with _bcol:
+        _scan_clicked = st.button(
+            "🔍 Scan targets", key=f"roll_scan_btn_{posid}", type="primary",
+            width="stretch",
+            help="Run the target scan with the filters above. Adjusting a "
+                 "filter won't rescan until you click this.")
+    if _scan_clicked:
+        with st.spinner(f"Scanning {ticker} targets…"):
+            df, _earn, err = fetch_and_enrich(
+                ticker, opt_key, int(min_dte), max_dte, provider=provider,
+                schwab_config=scfg)
+        if err:
+            _res = {"error": f"Couldn't scan {ticker}: {err}"}
+        elif df is None or df.empty:
+            _res = {"empty": True}
+        else:
+            _sub = df[(df["type"] == side)
+                      & (df["open_interest"] >= min_oi)
+                      & (df["volume"] >= min_vol)
+                      & (df["delta"].abs().between(d_lo, d_hi))].copy()
+            if _mins is not None:
+                _sub = _sub[_sub["strike"] >= float(_mins)]
+            if _maxs is not None:
+                _sub = _sub[_sub["strike"] <= float(_maxs)]
+            if net_credit_only and close_mid is not None:
+                # Net credit = new-leg mid − cost to close the current leg.
+                _sub = _sub[_sub["mid"] >= close_mid]
+            _sort = ("signal_score" if "signal_score" in _sub.columns
+                     else "iv_excess")
+            _sub = _sub.sort_values(
+                [_sort, "open_interest"],
+                ascending=[False, False]).reset_index(drop=True)
+            _res = {"sub": _sub}
+        st.session_state[_scan_key] = _res
+        st.session_state[f"roll_scangen_{posid}"] = (
+            st.session_state.get(f"roll_scangen_{posid}", 0) + 1)
+        # Fresh scan → drop any prior confirm-open guard so a re-pick reopens it.
+        st.session_state[f"_roll_confirm_guard_{posid}"] = None
 
-    df, _earn, err = fetch_and_enrich(
-        ticker, opt_key, int(min_dte), max_dte, provider=provider,
-        schwab_config=scfg)
-    if err:
-        st.warning(f"Couldn't scan {ticker}: {err}")
+    _scan_res = st.session_state.get(_scan_key)
+    if not _scan_res:
+        with _tcol:
+            st.markdown("Set your target filters above, then click **🔍 Scan "
+                        "targets** to rank roll candidates.")
         return
-    if df is None or df.empty:
+    if _scan_res.get("error"):
+        st.warning(_scan_res["error"])
+        return
+    if _scan_res.get("empty"):
         st.info("No chain returned for the target scan.")
         return
-
-    sub = df[(df["type"] == side)
-             & (df["open_interest"] >= min_oi)
-             & (df["volume"] >= min_vol)
-             & (df["delta"].abs().between(d_lo, d_hi))].copy()
-    if _mins is not None:
-        sub = sub[sub["strike"] >= float(_mins)]
-    if _maxs is not None:
-        sub = sub[sub["strike"] <= float(_maxs)]
-    if net_credit_only and close_mid is not None:
-        # Net credit = new-leg mid − cost to close the current leg; keep >= 0.
-        sub = sub[sub["mid"] >= close_mid]
+    sub = _scan_res["sub"]
     if sub.empty:
-        st.info("No target contracts pass these filters — loosen Min OI / Vol / "
-                "delta or the strike range, widen the DTE window, or uncheck "
-                "Net credit only.")
+        st.info("No target contracts passed those filters — loosen Min OI / Vol "
+                "/ delta or the strike range, widen the DTE window, or uncheck "
+                "Net credit only, then Scan again.")
         return
-
-    sort_col = "signal_score" if "signal_score" in sub.columns else "iv_excess"
-    sub = sub.sort_values([sort_col, "open_interest"],
-                          ascending=[False, False]).reset_index(drop=True)
 
     # NetCr = new-leg mid − cost to close the held leg (per share). Shown even
     # when the close re-quote is missing (blank), so the table still ranks.
@@ -551,10 +592,14 @@ def _render_roll_detail(pos: dict, scfg: dict, market_open, config_paper: bool,
         "Vol": st.column_config.NumberColumn("Vol", format="%d", width=65),
     }
     st.caption("🔍 **Select a target row** to build the roll.")
+    # Key includes the scan generation so each new scan gives a fresh table with
+    # nothing pre-selected (a stale selection would auto-open the confirm dialog).
+    _scangen = st.session_state.get(f"roll_scangen_{posid}", 0)
     event = st.dataframe(disp, column_config=col_cfg, hide_index=True,
                          width="stretch", on_select="rerun",
                          selection_mode="single-row",
-                         key=f"roll_target_{posid}")
+                         key=f"roll_target_{posid}_{_scangen}",
+                         height=df_height(disp))
     sel = event.selection.rows if hasattr(event, "selection") else []
     if not sel:
         # Deselecting clears the open-guard so re-picking the SAME target row
@@ -620,10 +665,16 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
         return f"${v:,.2f}" if v is not None and pd.notna(v) else "—"
 
     # Two per-leg snapshots side by side, even though they fill as a unit.
-    def _leg_rows(bid, ask, mid, last, oi, vol):
+    def _leg_rows(bid, ask, mid, last, oi, vol, last_ms=None):
+        # "Last" carries its print time (New York) on its own line beneath the
+        # price when available, so a stale leg is obvious while pricing the net.
+        _last = _money(last)
+        _lt = trade_actions.fmt_last_trade_et(last_ms)
+        if _lt:
+            _last += f"<br><span style='color:#94a3b8'>{_lt}</span>"
         return [("Bid", _money(bid)), ("Ask", _money(ask)), ("Mid", _money(mid)),
-                ("Last", _money(last)), ("OI", f"{int(oi):,}" if oi is not None
-                                         else "—"),
+                ("Last", _last), ("OI", f"{int(oi):,}" if oi is not None
+                                  else "—"),
                 ("Vol", f"{int(vol):,}" if vol is not None else "—")]
 
     cl_col, op_col = st.columns(2)
@@ -634,7 +685,8 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
             st.markdown(_kv_table_html(_leg_rows(
                 close_q.get("bid"), close_q.get("ask"), close_q.get("mid"),
                 close_q.get("last"), close_q.get("open_interest"),
-                close_q.get("volume"))), unsafe_allow_html=True)
+                close_q.get("volume"), close_q.get("last_trade_ms"))),
+                unsafe_allow_html=True)
         else:
             st.caption("Close-leg re-quote unavailable.")
     with op_col:
@@ -642,8 +694,8 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
                     f"{datetime.strptime(tgt_exp, '%Y-%m-%d').strftime('%b %d')}")
         st.markdown(_kv_table_html(_leg_rows(
             tgt.get("bid"), tgt.get("ask"), tgt.get("mid"), tgt.get("last"),
-            tgt.get("open_interest"), tgt.get("volume"))),
-            unsafe_allow_html=True)
+            tgt.get("open_interest"), tgt.get("volume"),
+            tgt.get("last_trade_ms"))), unsafe_allow_html=True)
 
     if open_mid is None or close_mid is None:
         st.info("Need a live mid on both legs to price the roll — hit 🔄 or try "
@@ -653,44 +705,88 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
     net_default = trade_actions.round_to_tick(abs(open_mid - close_mid))
     net_default = net_default if (open_mid - close_mid) >= 0 else -net_default
 
-    _c1, _c2, _ = st.columns([1.2, 1, 2])
-    with _c1:
-        net_limit = float(st.number_input(
-            "Net limit ($/sh · + credit / − debit)", value=float(net_default),
-            step=0.01, format="%.2f", key=f"roll_net_{posid}_{tgt_strike:g}_{tgt_exp}"))
-    with _c2:
-        qty = int(st.number_input("Contracts", min_value=1, max_value=held_qty,
-                                  value=held_qty, step=1, disabled=(held_qty == 1),
-                                  key=f"roll_qty_{posid}"))
+    # Bottom-aligned so the two-line Contracts label keeps its input level with
+    # the Net limit field.
+    # Session keys for this target (inputs, confirm arm, last result). Defined
+    # before the inputs because the confirm gate reads the inputs back by key —
+    # editing either one disarms a pending Place Roll (see confirm_gate).
+    _confirm_key = f"roll_confirm_{posid}_{tgt_strike:g}_{tgt_exp}"
+    _result_key = f"roll_result_{posid}"
+    _net_wid = f"roll_net_{posid}_{tgt_strike:g}_{tgt_exp}"
+    _qty_wid = f"roll_qty_{posid}"
+    _val_keys = (_net_wid, _qty_wid)
 
-    try:
-        roll = trade_actions.build_roll_order(
+    _c1, _c2, _ = st.columns([1.2, 1, 2], vertical_alignment="bottom")
+    with _c1:
+        net_limit = st.number_input(
+            "Net limit ($/sh · + credit / − debit)", value=float(net_default),
+            step=0.01, format="%.2f", key=_net_wid)
+    with _c2:
+        # Max rides in the label ("Contracts \n(Max N)"), matching the Sell
+        # dialog; a single-contract position has nothing to size, so the field
+        # stays disabled at 1. "  \n" hard-breaks the max onto its own line.
+        # No min_value/max_value: Streamlit refuses to commit an out-of-range
+        # entry and keeps the last valid one, which would arm Place for a size
+        # the user never typed. Validated below instead (see leaderboard).
+        qty = st.number_input(f"Contracts  \n(Max {held_qty})",
+                              value=held_qty, step=1,
+                              disabled=(held_qty == 1), key=_qty_wid)
+
+    # One builder, called two ways: here with the values on screen, and again in
+    # the Confirm callback with the values as of the click — so Confirm can stay
+    # clickable while an error shows and still refuse to arm a bad roll.
+    def _build_roll(net_v, qty_v):
+        return trade_actions.build_roll_order(
             ticker=ticker, option_type=otype, close_strike=float(pos["strike"]),
             close_expiration=str(pos["expiration"]), open_strike=tgt_strike,
-            open_expiration=tgt_exp, quantity=qty, net_limit=net_limit)
-    except ValueError as exc:
-        st.error(f"Can't build this roll: {exc}")
-        return
+            open_expiration=tgt_exp, quantity=int(qty_v),
+            net_limit=float(net_v))
 
-    _net_total = roll.net_amount
-    _kind = "credit" if roll.is_credit else "debit"
-    st.success((f"{roll.describe()} — net {_kind} "
-                f"${abs(_net_total):,.0f} total.").replace("$", "\\$"))
+    def _roll_error(net_v, qty_v) -> str | None:
+        """User-facing reason this roll can't be placed, or None."""
+        if net_v is None or qty_v is None:
+            # An emptied box returns None, which would reach the builder as
+            # int(None) and raise TypeError instead of a message.
+            return "Enter a net limit and a contract count."
+        if int(qty_v) > held_qty:
+            # build_roll_order validates quantity ≥ 1 but knows nothing about
+            # the size actually held.
+            return f"You hold {held_qty} contract(s) — can't roll {int(qty_v)}."
+        try:
+            _build_roll(net_v, qty_v)
+        except (ValueError, TypeError) as exc:
+            return f"Can't build this roll: {exc}"
+        return None
+
+    roll, _net_total, _kind = None, 0.0, "credit"
+    _roll_err = _roll_error(net_limit, qty)
+    if _roll_err:
+        st.error(_roll_err)
+    else:
+        roll = _build_roll(net_limit, qty)
+        _net_total = roll.net_amount
+        _kind = "credit" if roll.is_credit else "debit"
+        st.success((f"{roll.describe()} — net {_kind} "
+                    f"${abs(_net_total):,.0f} total.").replace("$", "\\$"))
 
     # Real position → LIVE only. Paper mode blocks (can't simulate rolling a
     # real broker position without desyncing the tracker), mirroring Trades.
-    _confirm_key = f"roll_confirm_{posid}_{tgt_strike:g}_{tgt_exp}"
-    _result_key = f"roll_result_{posid}"
     _result = st.session_state.get(_result_key)
     account_mask = pos.get("account_mask")
+    # Armed? Resolved before the Confirm button so Confirm draws disabled in the
+    # same frame Place Roll appears — never both live. An input edited into an
+    # invalid state since Confirm also disarms here.
+    _armed = confirm_gate.armed(_confirm_key, _val_keys,
+                                valid=_roll_err is None)
 
     if config_paper:
         st.warning("⚠️ Rolling sends a **real** order (your position is live), "
                    "but the app is in **paper mode** (`paper = true`). Set "
                    "`paper = false` in config.toml and restart to place rolls.")
-        st.button("Confirm Roll · 🔴 LIVE", disabled=True,
+        st.button("Confirm Roll", disabled=True,
                   key=f"roll_btn_{posid}", type="primary",
-                  help="Live order — set paper=false in config.toml.")
+                  help="Disabled in paper mode — set paper=false in config.toml "
+                       "and restart to place rolls.")
         return
 
     st.caption("🔴 LIVE — sends a real net-price roll (both legs together).")
@@ -706,12 +802,22 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
             st.button("Confirm Roll · 🔴 LIVE", disabled=True,
                       key=f"roll_btn_{posid}", type="primary", help=_blocked,
                       width="stretch")
-        elif st.button("Confirm Roll · 🔴 LIVE", key=f"roll_btn_{posid}",
-                       type="primary", width="stretch"):
-            st.session_state[_confirm_key] = True
-            st.session_state.pop(_result_key, None)
+        elif _armed:
+            # Armed → Place Roll is showing below; Cancel is the way back.
+            st.button("Confirm Roll · 🔴 LIVE", disabled=True,
+                      key=f"roll_btn_{posid}", type="primary",
+                      help=confirm_gate.ARMED_HELP, width="stretch")
+        else:
+            # Stays clickable even with an invalid net limit / size: the click
+            # commits the field and the callback re-validates, so a correction
+            # takes one click instead of blur-then-click.
+            st.button("Confirm Roll · 🔴 LIVE", key=f"roll_btn_{posid}",
+                      type="primary", width="stretch",
+                      on_click=confirm_gate.arm(_confirm_key, _val_keys,
+                                                clear_keys=(_result_key,),
+                                                validate=_roll_error))
 
-    if st.session_state.get(_confirm_key):
+    if _armed:
         st.warning((f"**Confirm roll** — {roll.describe()} · net {_kind} "
                     f"**${abs(_net_total):,.0f}** · 🔴 **LIVE**").replace(
                         "$", "\\$"))
@@ -724,9 +830,6 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
              "[class*='st-key-KEY'] button p{color:#fff !important;}"
              "</style>").replace("KEY", _cancel_box), unsafe_allow_html=True)
 
-        def _cancel(_k=_confirm_key):
-            st.session_state[_k] = False
-
         b1, b2, _ = st.columns([1, 1, 3])
         with b1:
             _do = st.button("Place Roll · 🔴 LIVE", key=f"roll_do_{posid}",
@@ -734,7 +837,7 @@ def _render_confirm(pos, tgt, close_q, close_mid, open_mid, posid, held_qty,
         with b2:
             _cb = st.container(key=_cancel_box)
             _cb.button("Cancel", key=f"roll_cancel_{posid}", width="stretch",
-                       on_click=_cancel)
+                       on_click=confirm_gate.disarm(_confirm_key))
         if _do:
             _result = _submit_roll(scfg, roll, close_mid, open_mid, account_mask)
             st.session_state[_result_key] = _result
@@ -819,14 +922,29 @@ def tab_rolls() -> None:
                                scfg.get("token_file", ""))
     config_paper = bool(scfg.get("paper", True))
 
+    # Hidden-position blacklist (⚙️ Settings) — applied at render time, not in
+    # the cached reader, so an edit lands on the next rerun (see trades.py).
+    _held_n = len(positions)
+    positions, _hidden = settings_ui.filter_hidden(positions, scope="roll")
     if not positions:
-        render_schwab_reauth_hint(
-            "schwab", key="roll_reauth_empty",
-            token_file=st.session_state.get("_schwab_token_file"))
-        empty_state(
-            "No rollable positions",
-            "No covered calls or short puts found in your Schwab account. Sell "
-            "a covered call or cash-secured put first, then roll it here.")
+        if _held_n:
+            # Hiding, not auth — the re-auth hint would be noise here.
+            empty_state(
+                "Every rollable position is hidden",
+                f"All {_held_n} covered call(s) / short put(s) in your Schwab "
+                f"account are hidden by your ⚙️ Settings. Unhide one there — or "
+                f"tick “show these” below — to roll it.")
+            # Still render the notice: it carries the reveal toggle.
+            settings_ui.render_hidden_notice(_hidden, scope="roll")
+        else:
+            render_schwab_reauth_hint(
+                "schwab", key="roll_reauth_empty",
+                token_file=st.session_state.get("_schwab_token_file"))
+            empty_state(
+                "No rollable positions",
+                "No covered calls or short puts found in your Schwab account. "
+                "Sell a covered call or cash-secured put first, then roll it "
+                "here.")
         return
 
     if config_paper:
@@ -834,7 +952,11 @@ def tab_rolls() -> None:
                    "below, but placing one needs `paper = false` (rolls act on "
                    "real positions). ")
 
-    st.caption(f"{len(positions)} rollable position(s) held at Schwab.")
+    if _hidden:
+        st.caption(f"{len(positions)} rollable position(s) in the table · "
+                   f"{len(_hidden)} hidden by ⚙️ Settings.")
+    else:
+        st.caption(f"{len(positions)} rollable position(s) held at Schwab.")
 
     # Per-position live quotes (for delta) fetched once in parallel, and
     # days-since-open from the app trade log — both feed the table cells below.
@@ -855,10 +977,15 @@ def tab_rolls() -> None:
         "_itm": None,   # hidden — drives the moneyness row shade
         "Strike": st.column_config.TextColumn("Strike", width=75),
         "Expiration": st.column_config.TextColumn("Expiration", width=110),
+        # Label spells out the parenthetical so the second number reads as
+        # days-open, not a second expiry figure. The dict key stays "DTE" — it
+        # has to match the DataFrame column.
         "DTE": st.column_config.TextColumn(
-            "DTE", width=110,
-            help="Days to expiration, and days since the position was opened "
-                 "when the app has a record of it."),
+            "DTE (days open)", width=140,
+            help="Days to expiration, and — in parentheses — how many days ago "
+                 "the position was opened, when the app has a record of it "
+                 "(trades placed here). Blank parens never appear: positions "
+                 "opened outside the scanner just show the DTE."),
         "Contracts": st.column_config.TextColumn(
             "Contracts", width=145,
             help="Open contracts; for covered calls, total shares held of the "
@@ -942,7 +1069,8 @@ def tab_rolls() -> None:
                                     for i in s.index], subset=["Spot/Day%"]))
         event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
                              width="stretch", on_select="rerun",
-                             selection_mode="single-row", key=key)
+                             selection_mode="single-row", key=key,
+                             height=df_height(styled))
         sel = event.selection.rows if hasattr(event, "selection") else []
         if sel:
             pos = dict(subset[sel[0]])
@@ -985,3 +1113,6 @@ def tab_rolls() -> None:
 
     st.caption("Estimates use a live Schwab mid; a roll executes both legs as "
                "one net-price order. Verify at your broker.")
+
+    # Hidden-position note last, so it never pushes the tables down.
+    settings_ui.render_hidden_notice(_hidden, scope="roll")

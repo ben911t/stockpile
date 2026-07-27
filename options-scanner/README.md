@@ -120,6 +120,42 @@ The options-analysis tabs:
 - **Neutral** — range-bound and delta-neutral strategies with a
   Max \|Δ\| slider for income hunting on long-DTE underlyings.
 
+### Settings (⚙️, top right)
+
+The gear in the title bar opens a Settings dialog, available from every
+tab. Today it holds one section: **hidden positions**.
+
+Tick an underlying to keep its option legs out of the **Close** and
+**Roll** tables — useful when a position is managed elsewhere, or is
+parked and you don't want it in the way. Hiding is whole-position: one
+tick covers every leg on that underlying, including ones you open later.
+The legs it covers are listed under each tick.
+
+Hiding is **display only**. The position is still held, still
+assignable, and still counts toward covered-call coverage and buying
+power — the blacklist never touches the sizing or coverage math.
+
+So a hidden position can't be forgotten, it's surfaced four ways:
+
+- The gear itself turns amber and reads **⚙️ N hidden** on every tab.
+- The Close and Roll tabs show a hidden count at the bottom of the tab,
+  with an expander listing what's hidden and a *show these anyway*
+  toggle that lasts only for the session.
+- If everything is hidden, the empty state says so rather than implying
+  your account is empty.
+- A hidden **short** leg within 7 days of expiration escalates from a
+  caption to a warning.
+
+Preferences live in `options-scanner/settings/settings.json`
+(gitignored), written by the dialog and safe to hand-edit. A narrower
+rule written in by hand — one strike/expiration, or all puts on a ticker
+— is honored by the tables and removable in the dialog, which lists it
+under *Other rules*. It's a
+separate layer from `config.toml`, which stays hand-edited only and
+keeps everything security- or safety-critical: Schwab credentials and
+the `paper` live-order flag are deliberately *not* editable from the UI.
+A malformed settings file hides nothing and says why.
+
 See [SPREADS.md](SPREADS.md) for the full strategy catalog, column
 reference, POP math, and caveats.
 
@@ -144,7 +180,9 @@ shared/public network, pass `--server.address 127.0.0.1` to bind only
 to localhost.
 
 To stop the server: `Ctrl+C` in the terminal where you started it.
-There is no in-app shutdown button.
+There is no in-app shutdown button. If `Ctrl+C` doesn't stop it —
+common on Windows with the `uv run run.py` launcher — see **`Ctrl+C`
+doesn't stop the running server (Windows)** under Common problems below.
 
 ### Changing the ports
 
@@ -223,6 +261,34 @@ same ticker; otherwise wait it out.
 Streamlit auto-reloads code, but `@st.cache_data` results survive
 across reruns. Open the hamburger menu (top-right) → **Clear cache** →
 rerun.
+
+**`Ctrl+C` doesn't stop the running server (Windows)**
+Most common with the combined `uv run run.py` launcher: it starts the
+Flask dashboard in its own process group, so a single `Ctrl+C` — or a
+`Ctrl+C` in a terminal that's no longer attached to the launch — can
+leave the whole tree (uv → run.py → Streamlit + Flask + their workers)
+alive with the ports still bound. The fix is to find the launcher's root
+process and kill the **tree** (`/T` reaps every child, `/F` forces it):
+
+```powershell
+# Find the `uv run run.py` root PID, then kill its whole process tree
+Get-CimInstance Win32_Process -Filter "Name='uv.exe'" |
+  Where-Object CommandLine -like '*run.py*' |
+  ForEach-Object { taskkill /F /T /PID $_.ProcessId }
+```
+
+If you launched Streamlit on its own (no `uv run run.py`, so there's no
+`uv` root), tree-kill by port instead:
+
+```powershell
+taskkill /F /T /PID (Get-NetTCPConnection -LocalPort 8501 -State Listen).OwningProcess
+```
+
+Confirm it's fully down — no output means the ports are clear:
+
+```powershell
+Get-NetTCPConnection -LocalPort 5000,8501 -State Listen -ErrorAction SilentlyContinue
+```
 
 **Orphan Python processes on Windows (port 8501 already in use)**
 If Streamlit was stopped with the terminal closed or crashed, Python
@@ -380,6 +446,11 @@ Override the directory with `--output-dir path/to/dir`.
 | OI | Open interest |
 | Vol | Web UI only. Today's trading volume — short-term liquidity signal complementing OI. |
 | NetCr | Roll mode only: new mid minus close cost |
+
+> **Times.** All dates and times shown in the app — including the
+> last-trade time beneath the **Last** price in the Sell, Roll, and Trades
+> dialogs — are U.S. Eastern (New York) market time (EST/EDT), regardless
+> of your local timezone.
 
 ## Example output and how to read it
 
