@@ -505,16 +505,23 @@ def save_html(
 
 # ── Portfolio report ─────────────────────────────────────────────────────────
 
+# Per-ticker leaderboard row count — keep in sync with
+# display.leaderboard._ROWS_PER_TICKER (kept local so the CLI/HTML path doesn't
+# import the streamlit module).
+_ROWS_PER_TICKER = 3
+
+
 def _leaderboard_html(results: list[dict], side: str, min_oi: int,
                       top_n: int, min_vol: int,
                       delta_range: tuple[float, float] | None = None,
                       buy: bool = False) -> str:
     """Cross-ticker leaderboard table for one side, mirroring the UI.
 
-    "Best per ticker, then fill": every ticker's #1 pick is guaranteed a
-    slot, remaining slots fill with the next-richest leftovers, total rows
-    = 2× the number of represented tickers, all sorted by IV+pp. Each
-    ticker's #1 row is shaded. Returns "" when nothing qualifies.
+    Every ticker contributes its top 3 contracts by IV+pp, grouped by ticker
+    so a calm name is represented as fully as an earnings-heavy one. The
+    tickers are ordered by their single richest contract, and within a ticker
+    the rows run best-first. Each ticker's #1 row is shaded. Returns "" when
+    nothing qualifies.
     """
     import pandas as pd
 
@@ -532,26 +539,22 @@ def _leaderboard_html(results: list[dict], side: str, min_oi: int,
         if sub.empty:
             continue
         sub = (sub.sort_values(["iv_excess", "open_interest"],
-                               ascending=[buy, False]).head(top_n).copy())
+                               ascending=[buy, False]).head(_ROWS_PER_TICKER).copy())
         sub["ticker"] = res["position"]["ticker"]
         sub["_is_ticker_top"] = [True] + [False] * (len(sub) - 1)
         per_ticker.append(sub.reset_index(drop=True))
     if not per_ticker:
         return ""
 
-    target = 2 * len(per_ticker)
-    guaranteed = pd.concat([t.iloc[[0]] for t in per_ticker], ignore_index=True)
-    leftovers = [t.iloc[1:] for t in per_ticker if len(t) > 1]
-    if leftovers:
-        pool = (pd.concat(leftovers, ignore_index=True)
-                .sort_values(["iv_excess", "open_interest"],
-                             ascending=[buy, False]))
-        board = pd.concat([guaranteed, pool.head(max(0, target - len(guaranteed)))],
-                          ignore_index=True)
-    else:
-        board = guaranteed
-    board = (board.sort_values(["iv_excess", "open_interest"],
-                               ascending=[buy, False]).head(target))
+    board = pd.concat(per_ticker, ignore_index=True)
+    # Order tickers by their single best contract's IV+pp, keep each ticker's
+    # rows together (the `ticker` tiebreaker), and within a ticker keep
+    # best-first.
+    board["_rank"] = board.groupby("ticker")["iv_excess"].transform(
+        "min" if buy else "max")
+    board = (board.sort_values(["_rank", "ticker", "iv_excess", "open_interest"],
+                               ascending=[buy, True, buy, False], kind="stable")
+             .drop(columns="_rank"))
 
     rows = []
     for _, r in board.iterrows():

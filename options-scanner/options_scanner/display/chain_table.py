@@ -24,7 +24,7 @@ import streamlit as st
 
 from options_scanner import iv_scores
 from options_scanner.format import fmt_strike
-from options_scanner.ui_theme import empty_state
+from options_scanner.ui_theme import df_height, empty_state
 
 from options_scanner.display.chain_styling import (
     SPREAD_HELP,
@@ -190,5 +190,5 @@ def show_chain_table(df_exp: pd.DataFrame, buy: bool, mode: str,
                                                          format="$%+.2f",
                                                          width=85)
     st.dataframe(styled, column_config=col_cfg, hide_index=True,
-                 width="stretch")
+                 width="stretch", height=df_height(styled))
     stamp_caption()

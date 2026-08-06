@@ -91,6 +91,7 @@ def fetch_chain_schwab(ticker: str, opt_type: str = "both",
                         vega=safe_float(opt.get("vega")),
                         open_interest=safe_int(opt.get("openInterest")),
                         volume=safe_int(opt.get("totalVolume")),
+                        last_trade_ms=safe_float(opt.get("tradeTimeInLong")),
                     )
                     if built is not None:
                         rows.append(built)

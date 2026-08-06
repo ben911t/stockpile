@@ -33,7 +33,8 @@ from options_scanner.display.spot_meta import (
     spot_value_html,
 )
 from options_scanner.fetch import fetch_and_enrich
-from options_scanner.ui_theme import metric_card, render_schwab_reauth_hint
+from options_scanner.ui_theme import (
+    df_height, metric_card, render_schwab_reauth_hint)
 
 
 def tab_gex() -> None:
@@ -284,6 +285,7 @@ def tab_gex() -> None:
         )
         st.dataframe(
             summary_df, hide_index=True, width='content',
+            height=df_height(summary_df),
             column_config={
                 "Ticker":    st.column_config.TextColumn(),
                 "Spot":      st.column_config.NumberColumn(format="$%.2f"),

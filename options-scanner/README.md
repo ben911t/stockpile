@@ -52,8 +52,9 @@ directly reachable at `http://localhost:5000`. `Ctrl+C` stops both. If a
 dashboard is already running on `:5000`, it's reused rather than
 restarted.
 
-The scanner has six options-analysis tabs (below); a seventh, **Live
-Charts**, embeds the live trading dashboard.
+The scanner has nine tabs (below) — seven for analysis and two
+(**Positions**, **Trades**) for managing what you hold at your broker; a
+tenth, **Live Charts**, embeds the live trading dashboard.
 
 To run them individually instead — each in its own terminal, with its own
 logs (the scanner's Live Charts tab shows a start hint until the dashboard
@@ -64,7 +65,13 @@ uv run streamlit run options-scanner/run_app.py   # scanner only  (:8501)
 uv run trading-dashboard/app.py                    # dashboard only (:5000)
 ```
 
-The options-analysis tabs:
+Two of them — **Positions** and **Trades** — are filled Schwab blue in
+the tab bar and sit side by side. Those read your live Schwab account,
+so they need Schwab both configured *and* selected as the data source;
+every other tab works on any source. Hovering the tab bar says the same
+thing.
+
+The tabs:
 
 - **Single Ticker** — type a symbol, pick Calls/Puts/Both and Sell/Buy,
   hit Scan. Filter inputs: Min DTE / Max DTE, Min OI, Min Vol (today's
@@ -99,6 +106,105 @@ The options-analysis tabs:
   tell apart from your own saved lists, which stay local. A Sell/Buy
   direction toggle ranks IV-rich premium to write or IV-cheap
   contracts to buy.
+- **Positions** — everything you hold at Schwab, whether or not it was
+  placed here: every option leg, and below them the stock behind them.
+  For each leg: moneyness (ITM%, which the rows are shaded and sorted by),
+  live delta, Ann% on the remaining time value, Intrinsic | Time, what
+  the stock and the option cost at open, market value and P/L per leg.
+  Select a row and choose what to do with it. All three actions open on
+  the same leg snapshot — spot, bid/ask/mid, last with its print time,
+  IV%, delta, OI, volume and IV+pp — so the contract reads the same
+  whichever verb you pick:
+  - **Close** (the default) — all or part of the leg.
+  - **Roll** — scans target strikes/expirations (ranked by IV+pp, with
+    the closing leg's own IV+pp shown for comparison and a Net Credit
+    column), then submits the buy-to-close and sell-to-open as **one
+    atomic net-price order**. This is the only place in the app that
+    *places* a roll. Offered on legs that can be rolled — short puts and
+    share-backed short calls; a long or naked leg says so and offers the
+    close builder instead.
+  - **Unwind** — exits a covered call completely: buys the call back
+    **and** sells the shares behind it, as one net-credit order. Both
+    legs fill together or neither does, so there's no window where the
+    call is closed and you still hold the stock (or the shares are gone
+    and the call is left naked). Offered on covered calls only — it
+    needs both halves — and priced as a net per share (stock proceeds
+    minus the buyback). Partial unwinds work at 100 shares per contract;
+    any extra shares are left untouched and the panel says how many.
+    The share leg gets the equity equivalents beside the call's
+    snapshot: bid/ask/mid/last plus today's move and volume, and Schwab's
+    mark when it differs from the midpoint — but no OI, IV or IV+pp,
+    which mean nothing for stock. Under the account balances
+    it shows the call's remaining **time
+    value** — per share, whole-leg, and annualized against spot — which
+    is what unwinding early hands back to whoever sells you the call.
+    Near zero means there's nothing left to wait for. The share sale's
+    gain/loss isn't tracked here: the trade log models premium received
+    and has no cost basis for your stock.
+
+  All three need `paper = false` — these are real positions, so paper
+  mode is view-only for closing, and build-and-price-only for rolling and
+  unwinding. Placing is where this tab stops: once an order is in, you
+  watch it fill (or cancel it) on the **Trades** tab, where every working
+  order lives.
+
+  Below the option legs, **Your Stock Positions** lists every share you
+  hold with the calls written against them, so the question "where could
+  I still sell a call?" is answered without cross-referencing two tables.
+  Each row is shaded by coverage:
+
+  | Shade | State | Meaning |
+  |-------|-------|---------|
+  | sky | **Uncovered** | No calls written, and a 100-lot is free |
+  | yellow | **Partly covered** | Some written; another lot still free |
+  | slate | **Covered** | Written to the last whole lot |
+  | red | **Over-written** | More calls than shares to back them |
+
+  "Covered" means no *writable* lot is left, not that every share is
+  spoken for — 450 shares against 4 calls leaves 50 unwritten, and
+  there's nothing you can do with 50 shares. **Over-written** is called
+  out separately because it's the only risky state here: the excess call
+  is naked, so assignment forces a buy at market. An uncovered odd lot
+  (under 100 shares) is left unshaded — it's uncovered, but there's
+  nothing to act on.
+
+  Only positions with **100+ uncovered shares** get a select checkbox —
+  they're listed first, and everything else (fully covered, an odd lot,
+  or over-written) sits below under *Nothing to write*, same columns and
+  shading but read-only. So the checkbox itself tells you where a trade
+  is available.
+
+  Select a row with a free lot and a **covered-call builder** opens,
+  led by the stock's spot and today's move (green up, red down) — where
+  the stock is and which way it's going is what decides which strikes
+  are worth scanning. Then the same filters as the roll builder:
+  Min OI, Min Vol, Min DTE, Max DTE, a |Delta| band, plus
+  Min Strike and Max Strike. Hit **Scan calls** and pick
+  from candidates ranked by IV+pp, with a Credit column for the full
+  coverable size. Setting **Min Strike** at or above your average cost
+  (shown in the table, and in the field's tooltip) is how you keep
+  assignment from realizing a loss on the shares. Picking a row opens the
+  same **Sell Call** dialog the Watchlist leaderboard uses, so the order
+  builder, contract cap, confirm gate and trade log are identical
+  whichever way you got there.
+- **Trades** — every trade placed from the scanner (the Watchlist
+  leaderboard's *Sell Put* / *Sell Call* dialogs). Each row shows the
+  contract, live cost-to-close, unrealized P/L, and an intraday chart
+  of the underlying; the collapsed header carries spot and today's
+  change so you can scan the list without expanding. The status word
+  distinguishes the two things people conflate: **working** = the
+  opening order is still out there unfilled, **held** = it filled and
+  you own the position. Then **closing** / **rolling** while an order
+  on it is working, and **closed** / **expired** / **assigned** at the
+  end. Close all or part
+  of a position from here: **Confirm Closing Trade** arms it, **Place
+  Closing Trade** sends it. A paper trade closes in the tracker only
+  (no broker order); a live one sends a real buy-to-close.
+  A roll placed on the Positions tab also shows here while it works, as
+  a `rolling` row headed `$150 → $160`. Expand it to watch both legs'
+  bid/ask/mid and the net the market is paying now against the limit on
+  your order — so you can see whether it's reachable or you're waiting
+  for the market to come to you. Cancel it from either tab.
 - **Portfolio** — drag in a brokerage CSV (Schwab, Robinhood, Fidelity,
   Merrill, or a hand-written
   [stockpile file](../docs/stockpile-format.md)), pick the format, hit
@@ -119,6 +225,106 @@ The options-analysis tabs:
   jade lizard, risk reversal).
 - **Neutral** — range-bound and delta-neutral strategies with a
   Max \|Δ\| slider for income hunting on long-DTE underlyings.
+
+### Placing trades: what protects you
+
+Every screen that can send an order — the Sell Put / Sell Call dialogs,
+both close builders, the roll, and the unwind — works the same way:
+
+- **`paper` decides everything.** `paper = true` in `config.toml`
+  records simulations and sends nothing. `paper = false` sends real
+  orders. The mode shows as a **📝 PAPER** / **🔴 LIVE** badge in the
+  title bar on every tab, and again on the buttons that would send.
+  It's deliberately not editable from the UI — but you don't have to
+  restart to change it: the file is re-read on every rerun, so edit it
+  and click anything in the app (`config.toml` isn't a watched source
+  file, so saving alone won't refresh the page). Watch the title-bar
+  badge to confirm the switch took.
+- **Two steps, never one.** *Confirm…* arms the order for the exact
+  values on screen; only *Place…* sends. Editing the limit or the
+  contract count disarms it, so Place can never apply to numbers you
+  didn't confirm — as does switching a selected position between Close,
+  Roll and Unwind, since those are three different orders. Confirm greys
+  out while armed — **Cancel** is the way back — and the two buttons are
+  never both live.
+- **Your inputs are validated, not silently clamped.** Ask for more
+  contracts than you can cover and you get told why ("5 contracts
+  exceeds the 4 you can cover"), rather than the field quietly snapping
+  back to a number you didn't choose. Confirm stays clickable so a
+  correction takes one click.
+- **Live orders are market-gated.** Outside 9:30–16:00 ET Mon–Fri, or
+  when market hours can't be confirmed, the live path is disabled.
+
+Rolls and unwinds act on real positions, so they're live-only by design
+— a simulated one would desync the tracker from your broker.
+
+### Settings (⚙️, top right)
+
+The gear in the title bar opens a Settings dialog, available from every
+tab. It holds two sections: **hidden positions** and **masked
+balances**.
+
+#### Hidden positions
+
+Tick a symbol to keep it out of the **Positions** tab — useful when a
+position is managed elsewhere, or is parked and you don't want it in the
+way. Hiding is **all or nothing per symbol**: one tick covers every
+option leg on that underlying, including ones you open later, *and* its
+shares in the stocks table. What each tick covers is listed underneath
+it ("2 leg(s) + 400 shares").
+
+Every symbol you hold is offered, including ones you hold **only shares
+of** — a name with no options on it at all is still pickable. A narrower
+hand-written rule (one strike, or all puts on a ticker) describes a leg,
+so it leaves the stock row alone.
+
+Hiding is **display only**. The position is still held, still
+assignable, and still counts toward covered-call coverage and buying
+power — the blacklist never touches the sizing or coverage math.
+
+So a hidden position can't be forgotten, it's surfaced four ways:
+
+- The gear itself turns amber and shows the count of hidden symbols
+  (**⚙️ 3**) on every tab; hovering says what's hidden.
+- The Positions tab shows a hidden count at the bottom of the option
+  table, with an expander listing what's hidden and a *show these
+  anyway* toggle that lasts only for the session. The stocks table names
+  its hidden symbols in a caption of its own — a symbol you hold no
+  options on never reaches that expander, so it can't rely on it.
+- If everything is hidden, the empty state says so rather than implying
+  your account is empty.
+- A hidden **short** leg within 7 days of expiration escalates from a
+  caption to a warning.
+
+#### Masked balances
+
+For screen-sharing and recording. Tick **Mask account balances** and
+every account figure renders as `$•••••` — the buying-power line on the
+Positions table, both close builders, and the roll and unwind panels,
+plus the Sell dialog's available-funds readout and its full Account info
+panel.
+
+A **👁** button appears beside each masked figure. It reveals every
+masked number in the app at once, **for the session only** — the tick is
+what persists, so you can read a balance without quietly turning masking
+off for good. With masking on, the same button re-hides them (🙈); with
+masking off, there's no button to clutter the screens.
+
+Like hiding positions, this is **display only**. Sizing, coverage and
+affordability checks read the real figures either way, so masking can
+never change what an order does. It hides what's *in the account* — not
+what a trade costs: order prices, collateral, position values and P/L
+stay visible.
+
+Preferences live in `options-scanner/settings/settings.json`
+(gitignored), written by the dialog and safe to hand-edit. A narrower
+rule written in by hand — one strike/expiration, or all puts on a ticker
+— is honored by the tables and removable in the dialog, which lists it
+under *Other rules*. It's a
+separate layer from `config.toml`, which stays hand-edited only and
+keeps everything security- or safety-critical: Schwab credentials and
+the `paper` live-order flag are deliberately *not* editable from the UI.
+A malformed settings file hides nothing and says why.
 
 See [SPREADS.md](SPREADS.md) for the full strategy catalog, column
 reference, POP math, and caveats.
@@ -144,7 +350,9 @@ shared/public network, pass `--server.address 127.0.0.1` to bind only
 to localhost.
 
 To stop the server: `Ctrl+C` in the terminal where you started it.
-There is no in-app shutdown button.
+There is no in-app shutdown button. If `Ctrl+C` doesn't stop it —
+common on Windows with the `uv run run.py` launcher — see **`Ctrl+C`
+doesn't stop the running server (Windows)** under Common problems below.
 
 ### Changing the ports
 
@@ -223,6 +431,34 @@ same ticker; otherwise wait it out.
 Streamlit auto-reloads code, but `@st.cache_data` results survive
 across reruns. Open the hamburger menu (top-right) → **Clear cache** →
 rerun.
+
+**`Ctrl+C` doesn't stop the running server (Windows)**
+Most common with the combined `uv run run.py` launcher: it starts the
+Flask dashboard in its own process group, so a single `Ctrl+C` — or a
+`Ctrl+C` in a terminal that's no longer attached to the launch — can
+leave the whole tree (uv → run.py → Streamlit + Flask + their workers)
+alive with the ports still bound. The fix is to find the launcher's root
+process and kill the **tree** (`/T` reaps every child, `/F` forces it):
+
+```powershell
+# Find the `uv run run.py` root PID, then kill its whole process tree
+Get-CimInstance Win32_Process -Filter "Name='uv.exe'" |
+  Where-Object CommandLine -like '*run.py*' |
+  ForEach-Object { taskkill /F /T /PID $_.ProcessId }
+```
+
+If you launched Streamlit on its own (no `uv run run.py`, so there's no
+`uv` root), tree-kill by port instead:
+
+```powershell
+taskkill /F /T /PID (Get-NetTCPConnection -LocalPort 8501 -State Listen).OwningProcess
+```
+
+Confirm it's fully down — no output means the ports are clear:
+
+```powershell
+Get-NetTCPConnection -LocalPort 5000,8501 -State Listen -ErrorAction SilentlyContinue
+```
 
 **Orphan Python processes on Windows (port 8501 already in use)**
 If Streamlit was stopped with the terminal closed or crashed, Python
@@ -336,7 +572,7 @@ SPX!       use exactly "SPX" — fetches the stock, not the index
 | `--output-dir` | `options-scanner/output/` | Directory for HTML files |
 | `--json` / `--agent` | off | Emit JSON instead of a table (`--agent` implies `--json --quiet`, for scripting) |
 | `--roll` | — | Roll mode (requires `--type`, `--strike`, `--expiration`) |
-| `--data-source` | from config | `yahoo`, `schwab`, or `moomoo` — overrides config.toml |
+| `--data-source` | from config | `yahoo` or `schwab` — overrides config.toml. Moomoo is web-UI/config-only, not a flag value |
 | `--preset` | `current` | Surface-fit preset: `current` (global poly + IV+pp) or `v2` (per-expiration + z-score) |
 | `--algorithm` / `--fit-weights` / `--score` | from preset | Override individual surface-fit stages |
 
@@ -380,6 +616,11 @@ Override the directory with `--output-dir path/to/dir`.
 | OI | Open interest |
 | Vol | Web UI only. Today's trading volume — short-term liquidity signal complementing OI. |
 | NetCr | Roll mode only: new mid minus close cost |
+
+> **Times.** All dates and times shown in the app — including the
+> last-trade time beneath the **Last** price in the Sell, Roll, and Trades
+> dialogs — are U.S. Eastern (New York) market time (EST/EDT), regardless
+> of your local timezone.
 
 ## Example output and how to read it
 
@@ -428,7 +669,7 @@ down to your own risk tolerance:
 - Much better premium, but real risk of losing the shares
 
 A common covered call sweet spot is delta 0.25–0.40, which balances
-premium against assignment risk. Use `--delta-min 0.25 --delta-max
+premium against assignment risk. Use `--min-delta 0.25 --max-delta
 0.40` to filter to that range.
 
 ### Earnings
@@ -545,8 +786,10 @@ by IV excess so the richest new premium surfaces first.
 
 ## Data sources
 
-The tool supports three data sources, selectable via `config.toml`,
-the `--data-source` CLI flag, or the title-bar toggle in the web UI:
+The tool supports three data sources, selectable via `config.toml` or
+the title-bar toggle in the web UI. The `--data-source` CLI flag
+overrides the config for one run, but takes only `yahoo` or `schwab` —
+Moomoo has to be set in `config.toml`:
 
 | Source | Setup | Data quality |
 |--------|-------|-------------|

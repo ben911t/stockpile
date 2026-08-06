@@ -85,9 +85,16 @@ def _stock_position_rows(T, L):
     # Shares Held in the new layout.
     return [
         ["STOCK POSITION", ""],
+        # When shares are still held (E5<>0): net stock cost of the
+        # remaining shares (buys+sells) per held share — the open-position
+        # value, unchanged. When closed (E5=0, would divide by zero): fall
+        # back to the plain average purchase price, buys only / shares bought.
         ["Avg Cost / Share",
-         f"=IFERROR(-(SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Buy\")*J${T}:J${L})"
-         f"+SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Sell\")*J${T}:J${L}))/E5,0)"],
+         f"=IFERROR(IF(E5<>0,"
+         f"-(SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Buy\")*J${T}:J${L})"
+         f"+SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Sell\")*J${T}:J${L}))/E5,"
+         f"-SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Buy\")*J${T}:J${L})"
+         f"/SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Buy\")*G${T}:G${L})),0)"],
         ["Shares Held",
          f"=SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Buy\")*G${T}:G${L})"
          f"+SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Sell\")*G${T}:G${L})"],
@@ -400,7 +407,16 @@ def build_closed_sections(ticker, open_positions, last_row,
 
         "A3:B6": [
             ["CURRENT VALUES", ""],
-            ["** Adj Cost Basis / Share", f"=IFERROR(-SUM(J${T}:J${L})/E5,0)"],
+            # Closed position: shares held is 0, so instead of dividing the
+            # all-in net (which now includes the closing sale proceeds) by
+            # zero, exclude the stock-sale proceeds from the numerator and
+            # divide the remaining net cost — buys, premiums, dividends — by
+            # the total shares bought. Gives the per-share cost after income,
+            # comparable to the price you sold at.
+            ["** Adj Cost Basis / Share",
+             f"=IFERROR(-(SUM(J${T}:J${L})"
+             f"-SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Sell\")*J${T}:J${L}))"
+             f"/SUMPRODUCT((C${T}:C${L}=\"Stock\")*(B${T}:B${L}=\"Buy\")*G${T}:G${L}),0)"],
             ["Stock Price", ""],
             ["Last Updated", datetime.now().strftime("%m/%d/%y %H:%M")],
         ],

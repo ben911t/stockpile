@@ -110,7 +110,9 @@ def tab_single() -> None:
             else "Find new options"
         )
         st.session_state["s_min_dte"] = max(1, int(entry.get("min_dte", 30)))
-        st.session_state["s_max_dte"] = int(entry.get("max_dte", 90))
+        # 0 / absent in a saved entry means "no maximum" → clear the field.
+        _saved_max = int(entry.get("max_dte", 90) or 0)
+        st.session_state["s_max_dte"] = _saved_max if _saved_max > 0 else None
         st.session_state["s_min_oi"]  = int(entry.get("min_oi", 1))
         st.session_state["s_min_vol"] = int(entry.get("min_vol", 1))
         st.session_state["s_delta"]   = (_dmin, _dmax)
@@ -212,9 +214,16 @@ def tab_single() -> None:
             min_dte = st.number_input("Min DTE", value=30, min_value=1,
                                       key="s_min_dte")
         with n2:
-            max_dte_inp = st.number_input("Max DTE", value=90, min_value=0,
-                                          help="0 = no limit; otherwise ≥ Min DTE",
-                                          key="s_max_dte")
+            # Nullable: an empty field means "no maximum DTE". Seed the default
+            # (90) once via session state so it shows a value on first load but
+            # stays cleared once the user removes it — a plain value=90 can't be
+            # cleared (it snaps back), and value=None alone would reset to empty
+            # on every rerun.
+            if "s_max_dte" not in st.session_state:
+                st.session_state["s_max_dte"] = 90
+            max_dte_inp = st.number_input(
+                "Max DTE", value=None, min_value=1, key="s_max_dte",
+                help="Clear the field for no maximum; otherwise ≥ Min DTE.")
         with n3:
             min_oi = st.number_input("Min OI", value=1, min_value=0,
                                      key="s_min_oi")
@@ -398,10 +407,10 @@ def tab_single() -> None:
             st.session_state.pop("single_results", None)
             return
 
-        if 0 < int(max_dte_inp) < int(min_dte):
+        if max_dte_inp is not None and int(max_dte_inp) < int(min_dte):
             st.error(
                 f"Max DTE ({int(max_dte_inp)}) must be ≥ Min DTE "
-                f"({int(min_dte)}), or 0 for no limit."
+                f"({int(min_dte)}), or clear it for no limit."
             )
             st.session_state.pop("single_results", None)
             return
@@ -415,7 +424,10 @@ def tab_single() -> None:
             eff_opt_fetch = opt_map[option_type]
             eff_mode      = mode_map[option_type]
 
-        max_dte_arg = int(max_dte_inp) if max_dte_inp > 0 else None
+        max_dte_arg = int(max_dte_inp) if max_dte_inp is not None else None
+        # Persisted form for the Recent Scans store: 0 = "no maximum" (the store
+        # and its recall/display read 0/absent as unbounded).
+        max_dte_store = int(max_dte_inp) if max_dte_inp is not None else 0
         delta_min, delta_max = delta_range
 
         with st.spinner(f"Fetching {ticker_clean} option chain…"):
@@ -513,7 +525,7 @@ def tab_single() -> None:
             "delta_min": delta_min,
             "delta_max": delta_max,
             "min_dte": int(min_dte),
-            "max_dte": int(max_dte_inp),
+            "max_dte": max_dte_store,
             "min_oi": int(min_oi),
             "min_vol": int(min_vol),
             "top_n": int(top_n),
@@ -530,7 +542,7 @@ def tab_single() -> None:
         # that differ only in OI/vol/DTE.
         _shared = {
             "min_dte":   int(min_dte),
-            "max_dte":   int(max_dte_inp),
+            "max_dte":   max_dte_store,
             "min_oi":    int(min_oi),
             "min_vol":   int(min_vol),
             "delta_min": delta_min,
@@ -553,7 +565,7 @@ def tab_single() -> None:
                 "buy":         buy,
                 "option_type": option_type,
                 "min_dte":     int(min_dte),
-                "max_dte":     int(max_dte_inp),
+                "max_dte":     max_dte_store,
                 "min_oi":      int(min_oi),
                 "min_vol":     int(min_vol),
                 "delta_min":   delta_min,
@@ -628,6 +640,8 @@ def tab_single() -> None:
     if rcc is not None:
         st.info(f"Rolling {res['roll_type']} {fmt_strike(res['roll_strike'])} "
                 f"{res['roll_exp_str']} — close cost (mid): **${rcc:.2f}**")
+        st.caption("📋 Analysis only — to *place* a roll on a position you hold, "
+                   "use the **Positions** tab (live Schwab positions).")
 
     # Rescan button (fixed to header bar) + scan-criteria summary on
     # the same row. The button container is position:fixed via CSS so
@@ -693,9 +707,33 @@ def tab_single() -> None:
                           res.get("min_vol", 0), top_ranks=top_ranks)
 
     st.subheader("Top candidates — all chains")
+    # Assisted sell (Schwab, sell mode, not rolling): make these rows selectable
+    # so a covered call / cash-secured put can be placed straight from here. For
+    # calls the ticker's live Schwab share coverage gates selectability.
+    _inv_ctx = None
+    _ds = st.session_state.get("data_source", "yahoo")
+    _scfg = st.session_state.get("schwab_config") or {}
+    if _ds == "schwab" and not buy_r and rcc is None and _scfg.get("app_key"):
+        _cov = None
+        if mode_r in ("call", "both"):
+            from options_scanner.display.leaderboard import coverage_map
+            _cmap = coverage_map(_scfg.get("app_key", ""),
+                                 _scfg.get("app_secret", ""),
+                                 _scfg.get("callback_url", ""),
+                                 _scfg.get("token_file", ""))
+            _cov = (_cmap or {}).get(str(ticker_r).upper())
+        _inv_ctx = {
+            "ticker": ticker_r,
+            "ticker_df": df_fit_full,
+            "provider": _ds,
+            "next_earnings": ed[0] if ed else None,
+            "spot": spot,
+            "key_prefix": f"single_{ticker_r}",
+            "coverage": _cov,
+        }
     show_scan_results(df_filt, mode_r, buy_r, rcc,
                        res["min_oi"], res["top_n"],
-                       res.get("min_vol", 0))
+                       res.get("min_vol", 0), investigate_ctx=_inv_ctx)
 
     # ── Monte Carlo trade analyzer ────────────────────────────────────────
     # Pick any candidate from the ranked table above and simulate its

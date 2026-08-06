@@ -26,6 +26,16 @@ def test_ceil_to_tick():
     assert ta.ceil_to_tick(3.95) == 3.95     # float-noise guard: no jump
 
 
+def test_floor_to_tick():
+    assert ta.floor_to_tick(3.98) == 3.95    # nickel tick rounds DOWN
+    assert ta.floor_to_tick(2.459) == 2.45   # penny tick rounds DOWN
+    assert ta.floor_to_tick(3.95) == 3.95    # already on tick, unchanged
+    assert ta.floor_to_tick(3.90) == 3.90    # float-noise guard: no drop
+    # Capping a SELL suggestion at the ask: the result never exceeds the ask.
+    for ask in (0.03, 0.55, 3.04, 12.37):
+        assert ta.floor_to_tick(ask) <= ask
+
+
 def test_avg_fill_price_weights_by_quantity():
     order = {"orderActivityCollection": [
         {"activityType": "EXECUTION", "executionLegs": [
@@ -84,6 +94,21 @@ def test_model_limit_prices_a_put():
     assert m is not None and m > 0
 
 
+def test_model_limit_prices_the_requested_side():
+    """A covered call must price the CALL, not the (far pricier ITM) put at the
+    same OTM-call strike — the bug where a $1.50 call got an $8+ put limit."""
+    # Strike above spot: OTM call (cheap) vs ITM put (expensive).
+    call = ta.model_limit(spot=95.0, strike=105.0, dte=45, iv=0.55,
+                          option_type="call")
+    put = ta.model_limit(spot=95.0, strike=105.0, dte=45, iv=0.55,
+                         option_type="put")
+    assert call is not None and put is not None
+    assert call < put                                   # call ≪ ITM put
+    # "C"/"P" aliases resolve the same way as call/put.
+    assert ta.model_limit(spot=95.0, strike=105.0, dte=45, iv=0.55,
+                          option_type="C") == call
+
+
 def test_model_limit_missing_inputs():
     assert ta.model_limit(spot=None, strike=90, dte=45, iv=0.5) is None
     assert ta.model_limit(spot=95, strike=90, dte=0, iv=0.5) is None
@@ -124,6 +149,110 @@ def test_build_put_sell_order_capacity_guard():
         ta.build_put_sell_order(ticker="AAPL", strike=180,
                                 expiration="2026-01-16", limit=2.0, quantity=2,
                                 capacity=20_000)
+
+
+def test_build_option_sell_order_call():
+    o = ta.build_option_sell_order(ticker="AAPL", strike=200,
+                                   expiration="2026-01-16", limit=3.0,
+                                   quantity=2, option_type="C")
+    assert o.option_type == "C"
+    assert o.shares_to_cover == 200       # 100 × 2
+    assert o.credit == 600.0              # 3.0 × 100 × 2
+    assert "$200 CALL" in o.describe()
+
+
+def test_build_option_sell_order_coverage_guard():
+    # 3 calls need 300 shares covered, but only 2 are coverable.
+    with pytest.raises(ValueError):
+        ta.build_option_sell_order(ticker="AAPL", strike=200,
+                                   expiration="2026-01-16", limit=3.0,
+                                   quantity=3, option_type="C", max_contracts=2)
+
+
+def test_build_option_sell_order_coverage_guard_names_the_numbers():
+    # The message is the user's only feedback that an over-cover size was
+    # rejected — the widget no longer clamps it (Streamlit's own clamp silently
+    # kept the last valid value, which armed Place for a size never typed).
+    with pytest.raises(ValueError, match="5 contracts exceeds the 4"):
+        ta.build_option_sell_order(ticker="CPNG", strike=30,
+                                   expiration="2026-09-18", limit=1.0,
+                                   quantity=5, option_type="C",
+                                   max_contracts=4)
+
+
+# ── close_input_error: the closing screens' equivalent of the order builder ───
+
+def test_close_input_error_accepts_a_usable_close():
+    assert ta.close_input_error(1.25, 2, 4) is None
+    assert ta.close_input_error(1.25, 4, 4) is None      # all of it
+
+
+def test_close_input_error_rejects_more_than_held():
+    msg = ta.close_input_error(1.25, 5, 4)
+    assert msg and "4 contract(s)" in msg and "5" in msg
+
+
+def test_close_input_error_rejects_nonpositive_limit():
+    assert "positive" in ta.close_input_error(0.0, 1, 4)
+    assert "positive" in ta.close_input_error(-0.5, 1, 4)
+
+
+def test_close_input_error_rejects_zero_contracts():
+    assert "at least 1" in ta.close_input_error(1.25, 0, 4)
+
+
+def test_close_input_error_rejects_emptied_inputs():
+    # st.number_input returns None when its box is cleared.
+    for limit, n in ((None, 2), (1.25, None), (None, None)):
+        assert ta.close_input_error(limit, n, 4) is not None
+
+
+def test_close_input_error_rejects_unusable_types():
+    assert ta.close_input_error("abc", 2, 4) is not None
+
+
+def test_calls_coverable_nets_existing_short_calls():
+    assert ta.calls_coverable(500) == 5            # 500 / 100
+    assert ta.calls_coverable(500, 2) == 3         # minus 2 already written
+    assert ta.calls_coverable(150, 1) == 0         # 1 coverable − 1 = 0
+    assert ta.calls_coverable(50) == 0             # < 100 shares
+    assert ta.calls_coverable(None) is None
+
+
+def test_held_shares_map_aggregates_equity_and_short_calls():
+    """One positions fetch → {TICKER: shares, short_calls}: multi-lot equity
+    sums, short CALLs net, short PUTs are ignored (they don't cover a call)."""
+    payload = {"securitiesAccount": {"positions": [
+        {"instrument": {"assetType": "EQUITY", "symbol": "CPNG"},
+         "longQuantity": 300},
+        {"instrument": {"assetType": "EQUITY", "symbol": "CPNG"},
+         "longQuantity": 200},                       # two lots → 500 shares
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "CPNG"}, "shortQuantity": 4},
+        {"instrument": {"assetType": "EQUITY", "symbol": "AMD"},
+         "longQuantity": 50},
+        {"instrument": {"assetType": "OPTION", "putCall": "PUT",
+                        "underlyingSymbol": "MSFT"}, "shortQuantity": 2},
+    ]}}
+
+    class _Acct:
+        def get_account_numbers(self):
+            return _Resp(200, [{"accountNumber": "1", "hashValue": "H"}])
+
+        def get_account(self, account_hash, fields=None):
+            return _Resp(200, payload)
+
+    m = ta.held_shares_and_short_calls_map(_Acct())
+    assert m["CPNG"] == {"shares": 500.0, "short_calls": 4}
+    assert m["AMD"] == {"shares": 50.0, "short_calls": 0}
+    assert "MSFT" not in m                           # short put ≠ call cover
+    assert ta.calls_coverable(m["CPNG"]["shares"],
+                              m["CPNG"]["short_calls"]) == 1   # 5 − 4
+    assert ta.calls_coverable(m["AMD"]["shares"],
+                              m["AMD"]["short_calls"]) == 0     # < 100 net
+    # single-ticker view delegates to the same parse (case-insensitive)
+    assert ta.held_shares_and_short_calls(_Acct(), "cpng") == (500.0, 4)
+    assert ta.held_shares_and_short_calls(_Acct(), "TSLA") == (0.0, 0)
 
 
 # ── market hours / LIVE placement (fake client, no network) ──────────────────
@@ -269,6 +398,22 @@ def test_place_put_close_order_rejects_invalid():
     assert res["ok"] is False and c.placed is None
 
 
+def test_place_option_close_order_long_submits_sell_to_close():
+    # A long leg (direction="long") closes with SELL_TO_CLOSE, not buy-to-close.
+    c = _FakeClient(place=_Resp(201, loc=".../orders/78"))
+    res = ta.place_option_close_order(c, ticker="AMD", strike=100.0,
+                                      expiration="2026-07-17", limit=3.20,
+                                      quantity=1, account_hash="HASH",
+                                      option_type="C", direction="long")
+    assert res["ok"] is True
+    sent_hash, spec = c.placed
+    assert sent_hash == "HASH"
+    leg = spec.build()["orderLegCollection"][0]
+    assert leg["instruction"] == "SELL_TO_CLOSE"
+    assert leg["instrument"]["symbol"] == "AMD   260717C00100000"
+    assert leg["quantity"] == 1
+
+
 def test_get_order_status_parses_and_flags_cancelable():
     accts = _Resp(200, [{"accountNumber": "111118556", "hashValue": "H"}])
     filled = _FakeClient(accounts=accts,
@@ -296,3 +441,250 @@ def test_cancel_order_ok_and_surfaces_error():
     bad = _FakeClient(accounts=accts,
                       cancel=_Resp(400, {"errors": [{"detail": "too late"}]}))
     assert ta.cancel_order(bad, "55", "8556") == {"ok": False, "error": "too late"}
+
+
+# ── OSI symbol parsing (inverse of _osi) ─────────────────────────────────────
+
+def test_parse_option_symbol_round_trips_with_osi():
+    for tk, strike, exp, right in [("AMD", 200, "2026-01-16", "C"),
+                                   ("AAPL", 152.5, "2027-12-17", "P"),
+                                   ("F", 7.5, "2025-08-15", "C")]:
+        sym = ta._osi(tk, strike, exp, right)
+        root, exp_iso, cp, k = ta._parse_option_symbol(sym)
+        assert (root, exp_iso, cp) == (tk, exp, right)
+        assert abs(k - strike) < 1e-9
+
+
+def test_parse_option_symbol_rejects_non_options():
+    assert ta._parse_option_symbol("") is None
+    assert ta._parse_option_symbol("AAPL") is None          # too short
+    assert ta._parse_option_symbol("AMD   260116X00200000") is None  # bad right
+
+
+# ── live position readers ────────────────────────────────────────────────────
+
+def _positions_client(positions):
+    payload = {"securitiesAccount": {"positions": positions}}
+
+    class _Acct:
+        def get_account_numbers(self):
+            return _Resp(200, [{"accountNumber": "1", "hashValue": "H"}])
+
+        def get_account(self, account_hash, fields=None):
+            return _Resp(200, payload)
+
+    return _Acct()
+
+
+def test_open_option_positions_parses_legs_and_coverage():
+    c = _positions_client([
+        {"instrument": {"assetType": "EQUITY", "symbol": "AMD"},
+         "longQuantity": 200},
+        # Covered call: 200 shares cover 2 calls.
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "AMD", "symbol": "AMD   260116C00200000"},
+         "shortQuantity": 2, "averagePrice": 3.10, "marketValue": -900},
+        # Naked short call: only 50 shares of MSFT (none, actually) → not covered.
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "MSFT", "symbol": "MSFT  260116C00500000"},
+         "shortQuantity": 1, "averagePrice": 4.00, "marketValue": -420},
+        # Short put.
+        {"instrument": {"assetType": "OPTION", "putCall": "PUT",
+                        "underlyingSymbol": "AMD", "symbol": "AMD   260116P00150000"},
+         "shortQuantity": 3, "averagePrice": 2.00, "marketValue": -600},
+        # Long call — kept by the general reader, excluded from rollable.
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "NVDA", "symbol": "NVDA  260116C00900000"},
+         "longQuantity": 1, "averagePrice": 10.0, "marketValue": 1100},
+    ])
+    legs = ta.open_option_positions(c)
+    by = {(l["underlying"], l["option_type"], l["strike"]): l for l in legs}
+
+    amd_call = by[("AMD", "C", 200.0)]
+    assert amd_call["direction"] == "short" and amd_call["quantity"] == 2
+    assert amd_call["covered"] is True and amd_call["shares_held"] == 200.0
+    assert amd_call["avg_price"] == 3.10 and amd_call["expiration"] == "2026-01-16"
+
+    assert by[("MSFT", "C", 500.0)]["covered"] is False      # naked
+    assert by[("AMD", "P", 150.0)]["direction"] == "short"
+    assert by[("NVDA", "C", 900.0)]["direction"] == "long"
+
+
+def test_rollable_positions_keeps_covered_calls_and_short_puts_only():
+    c = _positions_client([
+        {"instrument": {"assetType": "EQUITY", "symbol": "AMD"},
+         "longQuantity": 200},
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "AMD", "symbol": "AMD   260116C00200000"},
+         "shortQuantity": 2},                                 # covered call ✓
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "MSFT", "symbol": "MSFT  260116C00500000"},
+         "shortQuantity": 1},                                 # naked call ✗
+        {"instrument": {"assetType": "OPTION", "putCall": "PUT",
+                        "underlyingSymbol": "AMD", "symbol": "AMD   260116P00150000"},
+         "shortQuantity": 3},                                 # short put ✓
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "NVDA", "symbol": "NVDA  260116C00900000"},
+         "longQuantity": 1},                                  # long call ✗
+    ])
+    got = {(p["underlying"], p["option_type"]) for p in ta.rollable_positions(c)}
+    assert got == {("AMD", "C"), ("AMD", "P")}
+
+
+def test_rollable_positions_lists_every_call_leg_of_a_share_backed_ticker():
+    """One row per strike/expiration: a ticker's multiple call legs must all be
+    listed as long as the underlying is share-backed — even a leg with more
+    contracts than shares/100 (they share the pool). Only a truly naked call
+    (no shares) is dropped."""
+    c = _positions_client([
+        {"instrument": {"assetType": "EQUITY", "symbol": "CPNG"},
+         "longQuantity": 300},                                # partial coverage
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "CPNG",
+                        "symbol": "CPNG  270115C00035000"},
+         "shortQuantity": 4},                     # 4 > 300/100, still listed ✓
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "CPNG",
+                        "symbol": "CPNG  270115C00025000"},
+         "shortQuantity": 1},                                 # second leg ✓
+        {"instrument": {"assetType": "OPTION", "putCall": "CALL",
+                        "underlyingSymbol": "ZZZ",
+                        "symbol": "ZZZ   270115C00010000"},
+         "shortQuantity": 1},                        # no ZZZ shares → naked ✗
+    ])
+    got = {(p["underlying"], p["strike"]) for p in ta.rollable_positions(c)}
+    assert ("CPNG", 35.0) in got and ("CPNG", 25.0) in got   # both legs listed
+    assert all(u != "ZZZ" for u, _ in got)                   # naked call dropped
+
+
+def test_open_option_positions_empty_on_failure():
+    class _Boom:
+        def get_account_numbers(self):
+            raise RuntimeError("down")
+    assert ta.open_option_positions(_Boom()) == []
+    assert ta.rollable_positions(_Boom()) == []
+
+
+# ── roll order model + placement ─────────────────────────────────────────────
+
+def test_build_roll_order_and_sign():
+    credit = ta.build_roll_order(
+        ticker="AMD", option_type="C", close_strike=150,
+        close_expiration="2026-01-16", open_strike=160,
+        open_expiration="2026-06-18", quantity=2, net_limit=1.25)
+    assert credit.is_credit is True
+    assert credit.net_amount == 250.0        # 1.25 × 100 × 2
+    assert "CALL" in credit.describe() and "net credit" in credit.describe()
+
+    debit = ta.build_roll_order(
+        ticker="AMD", option_type="P", close_strike=150,
+        close_expiration="2026-01-16", open_strike=140,
+        open_expiration="2026-06-18", quantity=1, net_limit=-0.40)
+    assert debit.is_credit is False
+    assert debit.net_amount == -40.0
+    assert "net debit" in debit.describe()
+
+
+def test_build_roll_order_rejects_bad_inputs():
+    base = dict(ticker="AMD", option_type="C", close_strike=150,
+                close_expiration="2026-01-16", open_strike=160,
+                open_expiration="2026-06-18", quantity=1, net_limit=1.0)
+    with pytest.raises(ValueError):                          # bad right
+        ta.build_roll_order(**{**base, "option_type": "X"})
+    with pytest.raises(ValueError):                          # qty < 1
+        ta.build_roll_order(**{**base, "quantity": 0})
+    with pytest.raises(ValueError):                          # non-positive strike
+        ta.build_roll_order(**{**base, "open_strike": 0})
+    with pytest.raises(ValueError):                          # identical legs
+        ta.build_roll_order(**{**base, "open_strike": 150,
+                               "open_expiration": "2026-01-16"})
+
+
+def test_place_roll_order_submits_two_leg_net_credit():
+    roll = ta.build_roll_order(
+        ticker="AMD", option_type="C", close_strike=150,
+        close_expiration="2026-01-16", open_strike=160,
+        open_expiration="2026-06-18", quantity=2, net_limit=1.25)
+    c = _FakeClient(place=_Resp(201, loc=".../orders/99"))
+    res = ta.place_roll_order(c, roll, "HASH")
+    assert res["ok"] is True and res["order_id"] == "99"
+    sent_hash, spec = c.placed
+    assert sent_hash == "HASH"
+    built = spec.build()
+    assert built["orderType"] == "NET_CREDIT"
+    assert built["price"] == "1.25"
+    legs = built["orderLegCollection"]
+    assert len(legs) == 2
+    close_leg = next(l for l in legs if l["instruction"] == "BUY_TO_CLOSE")
+    open_leg = next(l for l in legs if l["instruction"] == "SELL_TO_OPEN")
+    assert close_leg["instrument"]["symbol"] == "AMD   260116C00150000"
+    assert open_leg["instrument"]["symbol"] == "AMD   260618C00160000"
+    assert close_leg["quantity"] == 2 and open_leg["quantity"] == 2
+
+
+def test_place_roll_order_net_debit_uses_debit_type():
+    roll = ta.build_roll_order(
+        ticker="AMD", option_type="P", close_strike=150,
+        close_expiration="2026-01-16", open_strike=140,
+        open_expiration="2026-06-18", quantity=1, net_limit=-0.40)
+    c = _FakeClient(place=_Resp(201, loc=".../orders/12"))
+    res = ta.place_roll_order(c, roll, "HASH")
+    assert res["ok"] is True
+    built = c.placed[1].build()
+    assert built["orderType"] == "NET_DEBIT"
+    assert built["price"] == "0.40"          # abs of the net
+
+
+def test_place_roll_order_rejects_invalid_without_calling_broker():
+    bad = ta.RollOrder(ticker="AMD", option_type="C", close_strike=150,
+                       close_expiration="2026-01-16", open_strike=0,
+                       open_expiration="2026-06-18", quantity=1, net_limit=1.0)
+    c = _FakeClient(place=_Resp(201))
+    res = ta.place_roll_order(c, bad, "HASH")
+    assert res["ok"] is False and c.placed is None
+
+
+# ── how the sizing figure is labeled (Sell Put dialog) ───────────────────────
+# "Avail Cash" was on every account type, but only a CASH account's figure is
+# actually cash — on a margin account it's availableFundsNonMarginableTrade,
+# which is not the cash balance and reads as more money than is sitting there.
+
+def test_cash_account_figure_is_labeled_cash():
+    cap = ta.AccountCapacity(cash_available=25_000.0)
+    assert cap.amount == 25_000.0
+    assert cap.amount_field == "cashAvailableForTrading"
+    assert cap.amount_label == "Avail Cash"
+    assert "cash available" in cap.amount_note.lower()
+
+
+def test_margin_account_figure_is_not_called_cash():
+    cap = ta.AccountCapacity(non_marginable=42_000.0)
+    assert cap.amount == 42_000.0
+    assert cap.amount_label == "Avail Funds"
+    assert "cash" not in cap.amount_label.lower()
+    assert "not your cash balance" in cap.amount_note
+
+
+def test_available_funds_fallback_is_not_called_cash():
+    cap = ta.AccountCapacity(available_funds=17_000.0)
+    assert cap.amount_field == "availableFunds"
+    assert cap.amount_label == "Avail Funds"
+    assert "not your cash balance" in cap.amount_note
+
+
+def test_cash_field_wins_when_both_are_present():
+    # A cash account can report both; the cash figure is the honest one.
+    cap = ta.AccountCapacity(cash_available=10_000.0, non_marginable=90_000.0)
+    assert cap.amount == 10_000.0 and cap.amount_label == "Avail Cash"
+
+
+def test_no_balances_has_no_note_and_a_neutral_label():
+    cap = ta.AccountCapacity()
+    assert cap.amount is None and cap.amount_field is None
+    assert cap.amount_note == "" and cap.amount_label == "Avail Funds"
+
+
+def test_buying_power_never_becomes_the_sizing_figure():
+    # Margin BP would over-size a cash-secured put; it stays informational.
+    cap = ta.AccountCapacity(buying_power=500_000.0)
+    assert cap.amount is None

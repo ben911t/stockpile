@@ -94,3 +94,53 @@ def test_expiration_rate_limit_propagates(monkeypatch):
     monkeypatch.setattr(yf, "Ticker", _Ticker)
     with pytest.raises(RateLimitError):
         chain._fetch_chain_yahoo("AAPL", min_dte=0, max_dte=60)
+
+
+class TestPortfolioRetryLoop:
+    """The CLI portfolio scan loop (_scan_positions) must wait+retry a
+    throttled ticker up to _RL_MAX_RETRIES times, then — once one ticker burns
+    its whole budget — fail every remaining ticker fast instead of crashing or
+    waiting per-ticker."""
+
+    @staticmethod
+    def _ok(pos):
+        return {"position": pos, "error": None, "df": None, "spot": 1.0,
+                "earnings_dates": [], "roll_close_costs": {}}
+
+    def _run(self, monkeypatch, scan_impl):
+        from options_scanner import portfolio
+        monkeypatch.setattr(portfolio.time, "sleep", lambda s: None)  # no real wait
+        monkeypatch.setattr(portfolio, "scan_position", scan_impl)
+        positions = [{"ticker": t} for t in ("AAA", "BBB", "CCC")]
+        return portfolio, list(
+            portfolio._scan_positions(positions, 30, 25, 0.7, "yahoo", None))
+
+    def test_retries_then_succeeds(self, monkeypatch):
+        """Throttled twice, then clears — the ticker still scans (no error)."""
+        calls = {}
+
+        def scan(pos, *a, **k):
+            calls[pos["ticker"]] = calls.get(pos["ticker"], 0) + 1
+            if pos["ticker"] == "AAA" and calls["AAA"] <= 2:
+                raise RateLimitError("429 Too Many Requests")
+            return self._ok(pos)
+
+        _, out = self._run(monkeypatch, scan)
+        assert calls["AAA"] == 3          # 2 throttles + 1 success
+        assert all(r["error"] is None for _, r in out)
+        assert [p["ticker"] for p, _ in out] == ["AAA", "BBB", "CCC"]
+
+    def test_gives_up_after_budget_and_fast_fails_rest(self, monkeypatch):
+        """Persistent throttle: AAA burns 1 initial + _RL_MAX_RETRIES attempts,
+        then BBB/CCC fail fast with a single attempt each (no more waiting)."""
+        n = {"calls": 0}
+
+        def scan(pos, *a, **k):
+            n["calls"] += 1
+            raise RateLimitError("429 Too Many Requests")
+
+        portfolio, out = self._run(monkeypatch, scan)
+        assert n["calls"] == (1 + portfolio._RL_MAX_RETRIES) + 1 + 1
+        assert all(r["error"] for _, r in out)          # every ticker failed
+        assert "still throttling" in out[0][1]["error"]
+        assert len(out) == 3

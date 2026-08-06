@@ -225,17 +225,18 @@ def fetch_option_chain_schwab(client, ticker: str, exp_str: str):
     """Fetch a single expiration for roll close-cost lookup.
 
     Returns an object with .calls and .puts DataFrames (columns: strike, bid,
-    ask, lastPrice, volume, openInterest, volatility, delta) — same interface
-    as stocks_shared.yahoo.fetch_option_chain().
+    ask, lastPrice, volume, openInterest, volatility, delta, last_trade_ms) —
+    same interface as stocks_shared.yahoo.fetch_option_chain(). last_trade_ms is
+    the last print's epoch-ms (Schwab tradeTimeInLong), 0 when absent.
     """
     import datetime
     from schwab.client import Client
 
     _empty = SimpleNamespace(
         calls=pd.DataFrame(columns=["strike", "bid", "ask", "lastPrice", "volume", "openInterest",
-                  "volatility", "delta"]),
+                  "volatility", "delta", "last_trade_ms"]),
         puts=pd.DataFrame(columns=["strike", "bid", "ask", "lastPrice", "volume", "openInterest",
-                  "volatility", "delta"]),
+                  "volatility", "delta", "last_trade_ms"]),
     )
 
     try:
@@ -274,10 +275,13 @@ def fetch_option_chain_schwab(client, ticker: str, exp_str: str):
                         "openInterest": int(opt.get("openInterest", 0) or 0),
                         "volatility": float(opt.get("volatility", 0) or 0),
                         "delta":     float(opt.get("delta", 0) or 0),
+                        # Epoch-ms of the last print; 0 when Schwab omits it.
+                        # Kept for the pre-confirm "Last @ time" annotation.
+                        "last_trade_ms": int(opt.get("tradeTimeInLong", 0) or 0),
                     })
         return pd.DataFrame(rows) if rows else pd.DataFrame(
             columns=["strike", "bid", "ask", "lastPrice", "volume", "openInterest",
-                  "volatility", "delta"])
+                  "volatility", "delta", "last_trade_ms"])
 
     return SimpleNamespace(
         calls=_parse_side(data.get("callExpDateMap", {})),

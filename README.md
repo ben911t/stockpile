@@ -49,14 +49,18 @@ A companion series on building a Yahoo Finance CLI with Claude Code
 - **[options-scanner](options-scanner/README.md)** — Rank options by
   IV vs. a fitted surface to surface covered call, cash-secured put,
   and roll candidates. Web UI, CLI, and portfolio scanner. Supports
-  Yahoo Finance, Schwab API, and Moomoo.
+  Yahoo Finance, Schwab API, and Moomoo. With Schwab connected it also
+  *places* trades — sell puts and covered calls, then close, roll, or
+  unwind any live leg — behind a two-step confirm and a `paper` flag
+  that defaults to simulation.
 - **[positions](positions/README.md)** — Google Sheets position
   tracker fed from brokerage CSV exports.
 - **[cost-basis-charts](cost-basis-charts/README.md)** — Interactive
   cost basis vs. price charts.
 - **[trading-dashboard](trading-dashboard/README.md)** — Live
   multi-pane charting dashboard with technical indicators for crypto
-  (Hyperliquid) and equities (Yahoo Finance). Standalone Flask app.
+  (Hyperliquid) and equities (Yahoo Finance or Schwab). Runs standalone
+  as a Flask app, and appears as the scanner's **Live Charts** tab.
 - **[google-sheets-setup](google-sheets-setup/README.md)** — Google
   Sheets API setup docs.
 - **shared** — pip-installable `stocks-shared` package: CSV parsers

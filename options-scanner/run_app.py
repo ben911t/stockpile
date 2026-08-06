@@ -19,14 +19,17 @@ from options_scanner.ui_theme import (
     disclaimer_chip,
     footer as ui_footer,
     inject_theme,
+    mark_broker_tabs,
     metric_card,
     register_altair_theme,
     section_header,
 )
 from options_scanner.display.scan_stamp import PROVIDER_LABELS, PROVIDER_COLORS
+from options_scanner.settings_ui import render_settings_button
 from options_scanner.tabs.gex import tab_gex
 from options_scanner.tabs.live_charts import tab_live_charts
 from options_scanner.tabs.portfolio import tab_portfolio, tab_watchlist
+from options_scanner.tabs.rolls import tab_positions
 from options_scanner.tabs.single import tab_single
 from options_scanner.tabs.spreads import tab_directional, tab_neutral, tab_spreads
 from options_scanner.tabs.trades import tab_trades
@@ -43,6 +46,26 @@ st.set_page_config(
 # every downstream widget renders in the redesigned visual language.
 inject_theme()
 register_altair_theme()
+
+# Keep widget values alive across tab switches. The lazy tab dispatch below
+# renders only the active tab, so a tab you navigate away from stops rendering —
+# and Streamlit garbage-collects the session_state of any widget not rendered
+# this run, resetting its inputs. Re-asserting a key at the top of the run
+# promotes it to the persistent (user) layer so it survives until the tab
+# renders again.
+#
+# BUT: write-restricted widgets (st.button, download_button, file_uploader,
+# data_editor, chart selections, …) RAISE if their key is set via session_state
+# (StreamlitValueAssignmentNotAllowedError). Every one of those stores a
+# bool / object / dict — never a plain str/int/float/tuple — so filtering by
+# type skips them safely while still persisting text/number/select/slider
+# inputs. (Scan *results* live under non-widget keys and persist regardless.)
+_PERSIST_TYPES = (str, int, float, tuple)
+for _k in list(st.session_state.keys()):
+    _v = st.session_state[_k]
+    # bool is an int subclass — exclude it so button/checkbox keys are skipped.
+    if isinstance(_v, _PERSIST_TYPES) and not isinstance(_v, bool):
+        st.session_state[_k] = _v
 
 
 # ── Legacy theme switcher (kept for backward-compat session_state keys) ─────
@@ -65,8 +88,13 @@ from options_scanner.config import (
     load_config, get_provider,
     get_schwab_config as _get_schwab_cfg,
     get_moomoo_config as _get_moomoo_cfg,
+    get_config_warnings as _get_cfg_warnings,
 )
 _app_cfg = load_config()
+# A malformed config.toml (e.g. paper = yes) no longer crashes the app — it
+# loads safe defaults and the problem is surfaced as a banner in the content
+# area below (not here: the top of the page sits under the fixed header pills).
+_cfg_warnings = _get_cfg_warnings(_app_cfg)
 _cfg_provider = get_provider(_app_cfg)
 _cfg_schwab = _get_schwab_cfg(_app_cfg)
 _cfg_moomoo = _get_moomoo_cfg(_app_cfg)
@@ -263,6 +291,11 @@ else:
 st.session_state["data_source"] = data_source
 st.session_state["schwab_config"] = _cfg_schwab if data_source == "schwab" else None
 st.session_state["moomoo_config"] = _cfg_moomoo if data_source == "moomoo" else None
+# Whether Schwab is configured *at all* (independent of the active source) — the
+# Positions tab needs this to tell "no broker configured" from "Schwab not selected".
+st.session_state["_schwab_configured"] = _schwab_configured
+# Schwab token file, so tabs can pass it to render_schwab_reauth_hint.
+st.session_state["_schwab_token_file"] = _cfg_schwab.get("token_file")
 
 # Pick up a re-authenticated Schwab token without a server restart. A fresh
 # token (re-auth button or schwab_auth.py) rewrites the token file; the
@@ -282,6 +315,31 @@ if data_source == "schwab" and _cfg_schwab:
         fetch_position.clear()
         fetch_spot_meta.clear()
     st.session_state["_schwab_token_mtime"] = _cur_tok_mtime
+
+# Header row, right side, on every tab: the PAPER/LIVE mode badge and the ⚙️
+# Settings gear. Two separately pinned elements sharing one `top` — see
+# styles.css for why they aren't a flex row in one container. Both must come
+# after `schwab_config` is seeded above: the dialog offers your live legs.
+#
+# The badge shows only when Schwab is configured — with no broker connected
+# nothing can be placed in either mode, so a "PAPER" chip would be stating
+# something that isn't in play.
+if _schwab_configured:
+    _paper_mode = bool(_cfg_schwab.get("paper", True))
+    _mode_tip = ("Paper mode (paper = true in config.toml) — placing a trade "
+                 "records a simulation; nothing is sent to your broker."
+                 if _paper_mode else
+                 "LIVE (paper = false) — placing a trade sends a REAL order to "
+                 "your broker.")
+    with st.container(key="mode_pill"):
+        st.markdown(
+            "<span class='osc-mode-badge "
+            + ("osc-mode-paper' " if _paper_mode else "osc-mode-live' ")
+            + f"title='{_mode_tip}'>"
+            + ("📝 PAPER" if _paper_mode else "🔴 LIVE")
+            + "</span>",
+            unsafe_allow_html=True)
+render_settings_button()
 
 
 # ── Page header chips ────────────────────────────────────────────────────
@@ -371,20 +429,34 @@ st.markdown(
 # Confirmation queued by an action that then reran (e.g. placing a trade):
 # a toast created right before st.rerun() is discarded with that run, so the
 # producer stashes the message and we show it here on the next run. Rendered
-# as a centered, fully-visible banner (st.toast is top-right + truncates):
-# fades out after ~6s and is click-through. $ → &#36; so it renders literally
-# rather than as LaTeX math.
+# as a centered, fully-visible banner (st.toast is top-right + truncates): the
+# first line is the headline; any newline-separated lines below it render as
+# bullets. Dismissed by the × or after 60s. Text is set via textContent, so $
+# renders literally (no LaTeX) and markdown is not interpreted — producers pass
+# plain text with '\n' between the headline and each bullet.
+# Producer convention: the headline is a short what-happened phrase with NO
+# trailing period, and every sentence after it gets its OWN line → its own
+# bullet. Don't pack several sentences into one line (they'd all land in the
+# headline, which is what this banner exists to avoid).
 _pending_toast = st.session_state.pop("_osc_toast", None)
 if _pending_toast:
     # Build the centered banner in the parent document via JS (st.markdown
-    # strips inline JS, so a click-to-dismiss × needs a component iframe). It
-    # stays until the user clicks × or 60s elapse; the timeout lives on
-    # window.parent so it survives this iframe being torn down on a rerun.
+    # strips inline JS, so a click-to-dismiss × needs a component iframe).
+    # It stays until the user explicitly dismisses it (× , "Got it", or Esc) —
+    # NO auto-timeout. These banners confirm a real order hitting a real
+    # account, so the user has to acknowledge one rather than risk missing it
+    # while looking elsewhere. Dismissal is therefore the only way out, which is
+    # why there are three affordances and the button is the obvious one.
     st.iframe(
         """
         <script>
         (function() {
           const doc = window.parent.document;
+          // Replace any banner still up: call ITS dismiss (parked on
+          // window.parent) so its Esc listener goes with it, not just the node.
+          if (typeof window.parent.__oscToastDismiss === 'function') {
+            window.parent.__oscToastDismiss();
+          }
           const prev = doc.getElementById('osc-center-toast');
           if (prev) prev.remove();
           const box = doc.createElement('div');
@@ -394,63 +466,118 @@ if _pending_toast:
             'background:#16a34a','color:#fff','padding:1.2rem 2.6rem 1.2rem 1.6rem',
             'border-radius:12px','box-shadow:0 10px 40px rgba(0,0,0,.4)',
             'font-size:1.08rem','line-height:1.45','text-align:center'].join(';');
-          const msg = doc.createElement('span');
-          msg.textContent = __MSG__;
+          // First line is the headline; any remaining lines become bullets.
+          const lines = __MSG__.split('\\n').map(function(s){return s.trim();})
+            .filter(function(s){return s.length;});
+          const head = doc.createElement('div');
+          head.textContent = lines.length ? lines[0] : '';
+          head.style.fontWeight = '600';
+          // Dismiss tears down the Esc listener too, so a stale handler can't
+          // pile up on window.parent across reruns.
+          function dismiss() {
+            box.remove();
+            doc.removeEventListener('keydown', onKey);
+            window.parent.__oscToastDismiss = null;
+          }
+          function onKey(e) { if (e.key === 'Escape') dismiss(); }
+          doc.addEventListener('keydown', onKey);
+          window.parent.__oscToastDismiss = dismiss;
           const x = doc.createElement('span');
           x.textContent = '\\u00d7';
           x.title = 'Dismiss';
           x.style.cssText = ['position:absolute','top:6px','right:12px',
             'cursor:pointer','font-size:1.4rem','line-height:1',
             'font-weight:700'].join(';');
-          x.onclick = function() { box.remove(); };
+          x.onclick = dismiss;
           box.appendChild(x);
-          box.appendChild(msg);
+          box.appendChild(head);
+          if (lines.length > 1) {
+            const ul = doc.createElement('ul');
+            ul.style.cssText = ['text-align:left','margin:0.55rem 0 0',
+              'padding-left:1.4rem','line-height:1.5'].join(';');
+            for (let i = 1; i < lines.length; i++) {
+              const li = doc.createElement('li');
+              li.textContent = lines[i];
+              ul.appendChild(li);
+            }
+            box.appendChild(ul);
+          }
+          // Explicit acknowledge button — with no auto-timeout, the way out has
+          // to be unmissable (the corner × alone is easy to overlook).
+          const ok = doc.createElement('button');
+          ok.textContent = 'Got it';
+          ok.style.cssText = ['margin:1rem auto 0','display:block',
+            'background:#fff','color:#15803d','border:none','cursor:pointer',
+            'padding:0.4rem 1.5rem','border-radius:7px','font-size:0.95rem',
+            'font-weight:700','font-family:inherit'].join(';');
+          ok.onclick = dismiss;
+          box.appendChild(ok);
           doc.body.appendChild(box);
-          window.parent.setTimeout(function() {
-            const b = doc.getElementById('osc-center-toast');
-            if (b) b.remove();
-          }, 60000);
+          ok.focus();
         })();
         </script>
         """.replace("__MSG__", json.dumps(_pending_toast)),
         height=1, width=1,
     )
 
-(
-    panel_single, panel_watchlist, panel_trades, panel_portfolio, panel_gex,
-    panel_spreads, panel_directional, panel_neutral,
-    panel_live,
-) = st.tabs(
-    ["Single Ticker", "Watchlist", "Trades", "Portfolio", "GEX",
-     "Spreads", "Directional", "Neutral", "Live Charts"]
-)
+# ── Tab bar (lazy) ─────────────────────────────────────────────────────────
+# st.tabs runs EVERY tab's body on every rerun, so a cold load pays for every
+# tab — including the ones that hit Schwab / the dashboard on render. A
+# session-state selector runs ONLY the active tab, so load cost is one tab
+# regardless of how many exist, and each tab's live data loads when you arrive.
+# Switching tabs is a rerun (native st.tabs switched purely client-side); that
+# rerun is the cost of laziness, and the center spinner covers it.
+TAB_NAMES = ["Single Ticker", "Watchlist", "Positions", "Trades",
+             "Portfolio", "GEX", "Spreads", "Directional", "Neutral",
+             "Live Charts"]
+TAB_FUNCS = {
+    "Single Ticker": tab_single, "Watchlist": tab_watchlist,
+    "Positions": tab_positions, "Trades": tab_trades,
+    "Portfolio": tab_portfolio, "GEX": tab_gex, "Spreads": tab_spreads,
+    "Directional": tab_directional, "Neutral": tab_neutral,
+    "Live Charts": tab_live_charts,
+}
+# Tabs that read a live Schwab account rather than a chain or an uploaded CSV.
+# Tinted in the tab bar so the dependency is visible before you click. Positions
+# is empty without Schwab; Trades still lists locally-tracked trades and closes
+# paper ones, but everything broker-side (cost-to-close, P/L, order status,
+# closing a live position) needs it. Live Charts is NOT here — its panes take
+# Yahoo or Hyperliquid too, so Schwab is one option rather than a requirement.
+BROKER_TABS = {"Trades", "Positions"}
 
-with panel_single:
-    tab_single()
+# Programmatic tab switch requested by an action that then reran (e.g. placing a
+# trade from the watchlist dialog → "Trades", a roll from the Positions tab). Apply
+# it BEFORE the tab-bar widget instantiates so it becomes the selected tab —
+# this replaces the old JS that clicked the native tab button.
+st.session_state.setdefault("active_tab", TAB_NAMES[0])
+_goto_tab = st.session_state.pop("_osc_goto_tab", None)
+if _goto_tab in TAB_NAMES:
+    st.session_state["active_tab"] = _goto_tab
 
-with panel_watchlist:
-    tab_watchlist()
+with st.container(key="osc_tabbar"):
+    _sel = st.segmented_control(
+        "Section", TAB_NAMES, label_visibility="collapsed", key="active_tab",
+        help="Blue tabs (Trades, Positions) read your live Schwab account — "
+             "they need Schwab configured *and* selected as the data source in "
+             "the top bar. Every other tab works on any source.",
+    )
+mark_broker_tabs(TAB_NAMES, BROKER_TABS)
 
-with panel_trades:
-    tab_trades()
+# segmented_control returns None if the active chip is clicked again (deselect);
+# fall back to the last resolved tab so a page is always rendered. `active_tab`
+# is the widget key (can't be written post-instantiation), so the fallback is
+# tracked under a separate key.
+_active = _sel if _sel in TAB_FUNCS else st.session_state.get(
+    "_active_tab_resolved", TAB_NAMES[0])
+st.session_state["_active_tab_resolved"] = _active
 
-with panel_portfolio:
-    tab_portfolio()
+# Config problems (malformed config.toml, bad paper flag) — shown here, in the
+# scrollable content area below the fixed header pills, so the banner is fully
+# visible instead of tucked behind the header row.
+for _cfg_warning in _cfg_warnings:
+    st.warning(_cfg_warning, icon="⚠️")
 
-with panel_gex:
-    tab_gex()
-
-with panel_spreads:
-    tab_spreads()
-
-with panel_directional:
-    tab_directional()
-
-with panel_neutral:
-    tab_neutral()
-
-with panel_live:
-    tab_live_charts()
+TAB_FUNCS[_active]()
 
 # ── Footer ───────────────────────────────────────────────────────────────
 ui_footer()

@@ -19,7 +19,7 @@ import streamlit as st
 
 from options_scanner import iv_scores
 from options_scanner.format import EARNINGS_WARN_LEGEND, fmt_strike
-from options_scanner.ui_theme import empty_state
+from options_scanner.ui_theme import df_height, empty_state
 
 from options_scanner.display.chain_styling import (
     SPREAD_HELP,
@@ -38,7 +38,8 @@ from options_scanner.display.scan_stamp import stamp_caption
 
 def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
             min_oi: int = 0, min_vol: int = 0,
-            buy: bool = False, opt_type: str = "option") -> None:
+            buy: bool = False, opt_type: str = "option",
+            investigate: dict | None = None) -> None:
     """Render the styled table for one option-type subset (or one
     per-position view from the Portfolio tab).
 
@@ -46,6 +47,11 @@ def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
     the table didn't fail to load — it just has nothing to show.
     When `roll_close_cost` is supplied (roll-an-existing-position
     flow), an extra Net Credit column is appended.
+
+    When `investigate` is supplied (Schwab assisted-sell, sell mode), the table
+    becomes single-row selectable and picking a row opens the Sell dialog. The
+    dict carries {ticker, ticker_df (full chain), provider, next_earnings, spot,
+    top_n, key_prefix}. None → the normal static table.
     """
     if sub.empty:
         empty_state(
@@ -164,17 +170,65 @@ def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
                                                          format="$%+.2f",
                                                          width=85)
 
-    st.dataframe(styled, column_config=col_cfg, hide_index=True,
-                 width="stretch")
+    if investigate is None:
+        st.dataframe(styled, column_config=col_cfg, hide_index=True,
+                     width="stretch", height=df_height(styled))
+        if _has_warn:
+            st.caption(EARNINGS_WARN_LEGEND)
+        stamp_caption()
+        return
+
+    # Assisted sell: selectable rows → the Sell dialog (shared with the
+    # leaderboard). One key + open-guard per table so multiple tables (sides /
+    # per-ticker expanders) don't collide.
+    from options_scanner.display.leaderboard import (contract_from_row,
+                                                     open_investigate,
+                                                     rows_fingerprint)
+    _word = "covered call" if opt_type == "call" else "cash-secured put"
+    st.caption(f"🔍 **Select a {opt_type} row** to investigate writing a "
+               f"{_word} — Schwab assisted trade (preview).")
+    # Row fingerprint in the key: a selection must not survive a filter change
+    # by row index, or the dialog reopens on whatever contract now sits at that
+    # index (see leaderboard.rows_fingerprint). The generation counter clears the
+    # selection after a dialog opens, so a dismissed dialog leaves the table
+    # ready to re-pick the same row. The guard below follows the key.
+    _gen_key = f"_inv_sel_gen_{investigate['key_prefix']}_{opt_type}"
+    _gen = int(st.session_state.get(_gen_key, 0))
+    _key = (f"{investigate['key_prefix']}_{opt_type}_"
+            f"{rows_fingerprint(sub)}_{_gen}")
+    event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
+                         width="stretch", on_select="rerun",
+                         selection_mode="single-row", key=_key,
+                         height=df_height(styled))
     if _has_warn:
         st.caption(EARNINGS_WARN_LEGEND)
     stamp_caption()
+
+    _guard = f"_inv_guard_{_key}"
+    sel = event.selection.rows if hasattr(event, "selection") else []
+    if not sel:
+        st.session_state[_guard] = None
+        return
+    row = sub.iloc[sel[0]]
+    contract = contract_from_row(
+        row, opt_type, investigate["ticker"],
+        next_earnings=investigate.get("next_earnings"),
+        spot_fallback=investigate.get("spot"))
+    if open_investigate(
+            contract, ticker_df=investigate.get("ticker_df"),
+            min_oi=min_oi, top_n=int(investigate.get("top_n", 5)),
+            min_vol=min_vol, provider=investigate.get("provider", "schwab"),
+            guard_key=_guard):
+        # Rebuild on the next full run (dismissing the dialog causes one) so the
+        # table returns with nothing selected.
+        st.session_state[_gen_key] = _gen + 1
 
 
 def show_scan_results(df: pd.DataFrame, mode: str, buy: bool,
                       roll_close_cost: float | None,
                       min_oi: int, top_n: int,
-                      min_vol: int = 0) -> None:
+                      min_vol: int = 0,
+                      investigate_ctx: dict | None = None) -> None:
     """Filter, rank, and render the top-N per option type.
 
     Splits the chain by `mode` ("call", "put", or "both"), sorts by
@@ -182,11 +236,21 @@ def show_scan_results(df: pd.DataFrame, mode: str, buy: bool,
     defaults to iv_excess), applies the OI/Vol floors, takes the top
     N, and delegates to `show_df`. Adds a subheader when rendering
     both sides so the user knows which table is which.
+
+    `investigate_ctx` (Schwab assisted-sell, set by the caller only in sell
+    mode) turns the rows into selectable Sell controls. It carries the single
+    ticker's {ticker, ticker_df, provider, next_earnings, spot, top_n,
+    key_prefix, coverage}. Puts are always selectable; a call table is
+    selectable only when the ticker has >=1 coverable covered call (coverage),
+    otherwise it renders static with a "not coverable" note.
     """
     iv_asc = buy
     sort_col = "signal_score" if "signal_score" in df.columns else "iv_excess"
     type_labels = {"call": "Calls", "put": "Puts"}
     to_show = [mode] if mode in type_labels else list(type_labels.keys())
+    # Assisted sell applies only in sell mode and outside the roll flow.
+    inv_on = (investigate_ctx is not None and not buy
+              and roll_close_cost is None)
 
     for opt_type in to_show:
         sub = (
@@ -199,5 +263,28 @@ def show_scan_results(df: pd.DataFrame, mode: str, buy: bool,
         sub["_rank"] = range(1, len(sub) + 1)
         if len(to_show) > 1:
             st.subheader(type_labels[opt_type])
+
+        inv = None
+        if inv_on:
+            if opt_type == "put":
+                inv = {**investigate_ctx, "top_n": top_n}
+            else:  # call — selectable only if coverable, else static + note
+                _cov = investigate_ctx.get("coverage")
+                _coverable = (_cov or {}).get("coverable") or 0
+                if _coverable >= 1:
+                    inv = {**investigate_ctx, "top_n": top_n}
+                else:
+                    show_df(sub, roll_close_cost, min_oi, min_vol,
+                            buy=buy, opt_type=opt_type)
+                    if _cov is None:
+                        st.caption("🔒 Covered-call selling needs your Schwab "
+                                   "share coverage — unavailable.")
+                    else:
+                        st.caption(
+                            f"🔒 Not coverable — you hold "
+                            f"{_cov.get('shares', 0):,.0f} share(s) "
+                            f"({_cov.get('short_calls', 0)} already in calls); "
+                            "need 100+ uncovered to write a covered call.")
+                    continue
         show_df(sub, roll_close_cost, min_oi, min_vol,
-                buy=buy, opt_type=opt_type)
+                buy=buy, opt_type=opt_type, investigate=inv)
