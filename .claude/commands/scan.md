@@ -42,7 +42,11 @@ uv run options-scanner/run_scanner.py $ARGUMENTS
 ```
 
 ### Mode flags
-`--calls`, `--puts`, `--buy`, `--roll`
+`--calls`, `--puts`, `--buy`, `--both`, `--roll`
+
+`--both` emits sell *and* buy rankings from a single chain fetch
+(cheaper than two runs); in JSON it nests `sell` / `buy` objects, each
+with its own `volume_filter_relaxed` flag.
 
 ### Roll flags (required with --roll)
 `--type {call,put}`, `--strike S`, `--expiration YYYY-MM-DD`
@@ -69,11 +73,11 @@ uv run options-scanner/run_scanner.py $ARGUMENTS
 
 ### Pluggable IV surface
 `--preset {current,v2}` — surface-fit preset (default: current).
-`--algorithm {global_poly,per_expiration}` — override the preset's
-fit algorithm. `--fit-weights {none,oi,inv_spread,vega}` — regression
-weighting. `--robust {none,huber,tukey}` — robust fit: downweight
-(huber) or reject (tukey) outliers so a stale print can't drag the
-surface toward itself. `--score {raw_pp,zscore,relative,
+`--algorithm {global_poly,per_expiration,earnings_segmented}` — override
+the preset's fit algorithm. `--fit-weights {none,oi,inv_spread,vega}`
+— regression weighting. `--robust {none,huber,tukey}` — robust fit:
+downweight (huber) or reject (tukey) outliers so a stale print can't
+drag the surface toward itself. `--score {raw_pp,zscore,relative,
 composite_exec,vrp,percentile}` — override the ranking score.
 Both presets exclude short-dated (≤60 DTE) options spanning the next
 earnings from the fit; longer-dated contracts stay in (one earnings is

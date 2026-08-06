@@ -19,7 +19,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
-from options_scanner import confirm_gate, iv_scores
+from options_scanner import confirm_gate, iv_scores, positions_cache, settings_ui
 from options_scanner.format import EARNINGS_WARN_LEGEND, fmt_strike
 from options_scanner.ui_theme import df_height
 from options_scanner.display.scan_stamp import stamp_caption
@@ -59,26 +59,10 @@ _PUT_BALANCE_NOTES = {
 }
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def _account_capacity(app_key: str, app_secret: str, callback_url: str,
-                      token_file: str) -> dict | None:
-    """Cached (60s) read-only Schwab capacity. Returns dict or None.
-
-    Keyed on the credentials so a re-auth (new token file) busts it via the
-    same path the rest of the app uses. Read-only — no order entry.
-    """
-    from stocks_shared.schwab_live import get_client
-    from options_scanner import trade_actions
-    try:
-        client = get_client(app_key, app_secret, callback_url, token_file)
-    except Exception:
-        return None
-    cap = trade_actions.fetch_account_capacity(client)
-    if cap is None:
-        return None
-    return {"cash": cap.cash_available, "bp": cap.buying_power,
-            "amount": cap.amount, "type": cap.account_type,
-            "mask": cap.account_mask, "balances": cap.balances}
+# Cached (60s) read-only balances. Lives in positions_cache so the Sell dialog
+# and the Positions tab share one fetch; aliased here so existing calls (and any
+# `.clear()`) keep working.
+_account_capacity = positions_cache.account_capacity
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -211,8 +195,9 @@ def _investigate_put_dialog(c: dict, ticker_df: "pd.DataFrame | None" = None,
     _ne = c.get("next_earnings")
     _earn_seg = f", Earnings {_ne.strftime('%b %d')}" if _ne else ""
     # Mode (PAPER vs LIVE) baked into the title bar so it's impossible to miss
-    # which one you're in before placing. Comes from config `paper` (set at
-    # app start; can't change mid-session without a restart).
+    # which one you're in before placing. Comes from config `paper`, re-read
+    # from config.toml on every rerun — editing the file applies on the next
+    # interaction, no restart.
     _paper = bool((st.session_state.get("schwab_config") or {}).get("paper",
                                                                     True))
     _mode = "📝 PAPER" if _paper else "🔴 LIVE"
@@ -220,7 +205,13 @@ def _investigate_put_dialog(c: dict, ticker_df: "pd.DataFrame | None" = None,
     _title = (f"🔍 Sell {_word} — {c['ticker']} {_spot_txt}{_earn_seg}"
               f"  ·  {_mode}")
 
-    @st.dialog(_title, width="large")
+    # on_dismiss="rerun" is load-bearing, not a nicety. Streamlit's default is
+    # "ignore": closing a dialog with ✕ / Esc / a click outside runs NOTHING, so
+    # the page behind it is never re-rendered. That left the selected row still
+    # checked — and since the open-guard sees no new selection, re-picking the
+    # same contract took an uncheck/recheck. A rerun re-renders the table, which
+    # by then has a bumped key (see _render_table) and so comes back clean.
+    @st.dialog(_title, width="large", on_dismiss="rerun")
     def _dlg() -> None:
         _investigate_put_body(c, ticker_df=ticker_df, min_oi=min_oi,
                               top_n=top_n, min_vol=min_vol, provider=provider)
@@ -478,12 +469,23 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
                     st.markdown("Share coverage unavailable — connect Schwab "
                                 "(Accounts & Trading access required).")
             elif cap_amt is not None:
+                # Label the figure by what it actually is. On a margin account
+                # this is availableFundsNonMarginableTrade, which is NOT the
+                # cash balance — calling it "Avail Cash" overstated what's
+                # sitting there. The note says which balance it came from and
+                # the Account info panel below has the real cash line.
+                # The account figure honors the ⚙️ mask; the per-contract
+                # collateral beside it does not — that's what the ORDER costs,
+                # not what you hold, and hiding it would leave the sizing note
+                # saying nothing.
                 st.markdown(
-                    f"**Avail Cash: \\${cap_amt:,.0f}**, "
+                    f"**{cap.get('amount_label', 'Avail Funds')}: "
+                    f"{settings_ui.mask_money(f'\\${cap_amt:,.0f}')}**, "
                     f"(\\${c['strike'] * 100:,.0f} each).  \n"
-                    "See Account info below for full balances.")
+                    + (cap.get("amount_note") or "")
+                    + " See Account info below for cash and full balances.")
             else:
-                st.markdown("Cash for puts unavailable — connect Schwab "
+                st.markdown("Funds for puts unavailable — connect Schwab "
                             "(Accounts & Trading access required).")
 
         # Order preview + validation. One builder, called two ways: here with the
@@ -598,9 +600,15 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         else:
             _cash_bits = [f"collateral **${order.collateral:,.0f}**"]
             if _acct_cash is not None:
-                _cash_bits.append(f"account cash **${_acct_cash:,.2f}**")
+                _cash_bits.append(
+                    f"account cash "
+                    f"**{settings_ui.mask_money(f'${_acct_cash:,.2f}')}**")
             if _coll_avail is not None:
-                _cash_bits.append(f"cash for puts **${_coll_avail:,.2f}**")
+                # Same figure as the sizing readout above, and labeled the same
+                # way — "cash for puts" was wrong on a margin account.
+                _cash_bits.append(
+                    f"{(cap or {}).get('amount_label', 'Avail Funds').lower()} "
+                    f"**{settings_ui.mask_money(f'${_coll_avail:,.2f}')}**")
         # Escape every $ so Streamlit markdown doesn't read $...$ as LaTeX math
         # (which eats the dollar signs and garbles the amounts).
         st.warning((
@@ -667,9 +675,14 @@ def _investigate_put_body(c: dict, ticker_df: "pd.DataFrame | None" = None,
         with st.expander(f"Account info{(' — ' + _hdr) if _hdr else ''}",
                          expanded=False):
             _bals = cap["balances"]
+            # Every row here is an account balance, so the whole snapshot goes
+            # behind the mask — percentages included, since a margin-equity
+            # percent says as much about the account as a dollar figure does.
+            settings_ui.render_reveal_toggle(f"acct_{c['ticker']}")
 
             def _fmt_bal(k, v):
-                return f"{v:,.2f}%" if "percent" in k.lower() else _money(v)
+                raw = f"{v:,.2f}%" if "percent" in k.lower() else _money(v)
+                return settings_ui.mask_money(raw)
 
             # The bolded/hover-noted fields are the cash-secured-put capacity
             # figures — meaningful for a put, but NOT the binding constraint for
@@ -759,14 +772,47 @@ def contract_from_row(row: "pd.Series", side: str, ticker: str, *,
     }
 
 
+def rows_fingerprint(frame) -> str:
+    """Short hash of a selectable table's row → contract mapping.
+
+    Folded into the table's widget key so the key changes **exactly** when a row
+    index would start pointing at a different contract. Without it, a selection
+    made before a filter change survived by row *index*: re-filtering the board
+    left row 2 selected but row 2 was now a different contract, which the
+    open-guard correctly read as a new selection — so moving the delta slider
+    popped the dialog open on a contract the user never clicked.
+
+    Keying on the mapping rather than on the filter values means an unrelated
+    rerun doesn't throw away a selection, while any change that reorders or
+    re-populates the table starts a fresh widget with nothing selected.
+    """
+    import hashlib
+    try:
+        ident = "|".join(
+            f"{r.get('ticker', '')}:{r.get('strike', '')}:"
+            f"{r.get('expiration', '')}"
+            for _, r in frame.iterrows())
+    except Exception:
+        return "na"
+    return hashlib.blake2s(ident.encode("utf-8"), digest_size=5).hexdigest()
+
+
 def open_investigate(contract: dict, *, ticker_df, min_oi: int, top_n: int,
-                     min_vol: int, provider: str, guard_key: str) -> None:
+                     min_vol: int, provider: str, guard_key: str) -> bool:
     """Open the Sell dialog for `contract`, but only on a NEW selection.
+    Returns True when it opened one this run.
 
     `guard_key` (one per selectable table) holds the last-opened contract so
     dismissing the dialog doesn't immediately reopen it while the row stays
     selected, and a fresh open clears that contract's stale confirm/result
-    state."""
+    state.
+
+    Callers use the return value to bump their table's key, which clears the row
+    selection on the next full run — Streamlit has no dialog-dismissed callback,
+    so the selection is cleared at *open* time instead. The row stays checked
+    only while the dialog is over it; once dismissed the table is fresh, and
+    clicking the same row opens it again with no uncheck/recheck dance.
+    """
     sel_key = (f"{contract['ticker']}|{contract['strike']}|"
                f"{contract['expiration']}")
     if st.session_state.get(guard_key) != sel_key:
@@ -776,6 +822,8 @@ def open_investigate(contract: dict, *, ticker_df, min_oi: int, top_n: int,
         st.session_state.pop(f"place_result_{_ck}", None)
         _investigate_put_dialog(contract, ticker_df=ticker_df, min_oi=min_oi,
                                 top_n=top_n, min_vol=min_vol, provider=provider)
+        return True
+    return False
 
 
 # How many contracts each ticker contributes to the cross-ticker leaderboard.
@@ -1106,16 +1154,26 @@ def _render_table(board: pd.DataFrame, side: str, min_vol: int,
     else:
         st.caption("🔍 **Select a put row** to investigate placing a cash-"
                    "secured put sell — Schwab assisted trade (preview).")
+    # Two things scope this widget's key. The fingerprint makes it a FRESH
+    # widget whenever the rows change, so a selection can't outlive the list it
+    # was made against (see rows_fingerprint). The generation counter is bumped
+    # each time a dialog opens, so the row doesn't stay checked behind a
+    # dismissed dialog — leaving it checked meant re-picking the same contract
+    # took an uncheck/recheck, since the guard sees no new selection.
+    _gen_key = f"_lb_sel_gen_{side}"
+    _gen = int(st.session_state.get(_gen_key, 0))
+    _table_key = f"lb_investigate_{side}_{rows_fingerprint(board)}_{_gen}"
     event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
                          width="stretch", on_select="rerun",
                          selection_mode="single-row",
-                         key=f"lb_investigate_{side}", height=df_height(styled))
+                         key=_table_key, height=df_height(styled))
     if _has_warn:
         st.caption(EARNINGS_WARN_LEGEND)
-    # Per-side open-guard key — Calls and Puts can both be selectable at once
-    # (opt_type "both"), so each table tracks its own last-opened contract; a
-    # shared key would make the two tables fight to reopen each other's dialog.
-    _guard_key = f"_lb_last_investigated_{side}"
+    # Open-guard scoped to this exact table — per side (Calls and Puts can both
+    # be selectable at once, and a shared key would make them fight to reopen
+    # each other's dialog) and per row set, so a rebuilt table starts ungated
+    # and re-picking the same contract opens it again.
+    _guard_key = f"_lb_last_investigated_{_table_key}"
     sel = event.selection.rows if hasattr(event, "selection") else []
     if not sel:
         # Deselecting clears the guard so re-selecting the SAME row reopens the
@@ -1128,7 +1186,10 @@ def _render_table(board: pd.DataFrame, side: str, min_vol: int,
     _tk = str(row["ticker"])
     contract = contract_from_row(
         row, side, _tk, next_earnings=(ticker_earnings or {}).get(_tk))
-    open_investigate(
-        contract, ticker_df=(ticker_dfs or {}).get(_tk),
-        min_oi=min_oi, top_n=top_n, min_vol=min_vol, provider=provider,
-        guard_key=_guard_key)
+    if open_investigate(
+            contract, ticker_df=(ticker_dfs or {}).get(_tk),
+            min_oi=min_oi, top_n=top_n, min_vol=min_vol, provider=provider,
+            guard_key=_guard_key):
+        # Rebuild this table on the next full run (which is what dismissing the
+        # dialog triggers) so it comes back with nothing selected.
+        st.session_state[_gen_key] = _gen + 1

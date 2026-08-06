@@ -8,7 +8,7 @@ Two entry points:
     point being that you can't forget you hid something.
 
 ``filter_hidden(legs, scope=…)`` / ``render_hidden_notice(hidden, scope=…)``
-    A pair used by the Close and Roll tabs. The first drops hidden legs from
+    A pair used by the Positions tab. The first drops hidden legs from
     what the tab is about to render, keeping only risk notices at the top (a
     broken settings file; a hidden short leg near expiration). The second draws
     the routine "N hidden" note, its list, and the session-only reveal toggle —
@@ -31,13 +31,84 @@ import streamlit as st
 
 from options_scanner import position_filters as pf
 from options_scanner import positions_cache, settings_store
+from options_scanner.format import md_escape
 
 # A hidden short leg this close to expiration gets a loud warning rather than a
 # quiet caption — assignment risk is exactly when a forgotten position bites.
 _NEAR_EXPIRY_DTE = 7
 
 
+# ── Masked balances ──────────────────────────────────────────────────────────
+# One preference, one placeholder, one session override — so every screen that
+# shows account money hides it the same way. This is *display only*: sizing,
+# coverage and affordability checks read the real figures either way, exactly
+# like hidden positions.
+
+_MASK = "•••••"
+_REVEAL_KEY = "_osc_reveal_balances"
+
+
+def balances_masked() -> bool:
+    """Whether account balances render as ``•••••`` right now.
+
+    The stored preference is the default; the 👁 toggle overrides it for the
+    session only (like the hidden-position "show these anyway" tick). So
+    unmasking to read a number doesn't quietly turn masking off for good — the
+    next session is masked again.
+    """
+    revealed = st.session_state.get(_REVEAL_KEY)
+    if revealed is not None:
+        return not revealed
+    return settings_store.get_mask_balances()
+
+
+def mask_money(text) -> str:
+    """`text` as given, or the placeholder when balances are masked.
+
+    Takes already-formatted text so each call site keeps its own precision and
+    units. The dollar placeholder stays markdown-escaped: an unescaped ``$``
+    pairs with another one elsewhere in the string and Streamlit renders
+    everything between them as LaTeX.
+    """
+    s = str(text)
+    if not balances_masked():
+        return s
+    return f"\\${_MASK}" if "$" in s else _MASK
+
+
+def render_reveal_toggle(key: str) -> None:
+    """The 👁 / 🙈 button beside a balances readout, when one is warranted.
+
+    Renders nothing unless masking is in play — with the preference off there's
+    nothing to reveal, and an always-present eye would be clutter on four
+    screens. Flips the session override, so one click reveals (or re-hides)
+    every masked figure in the app at once.
+    """
+    if not (settings_store.get_mask_balances()
+            or st.session_state.get(_REVEAL_KEY) is not None):
+        return
+    hidden = balances_masked()
+    st.button("👁" if hidden else "🙈", key=f"reveal_bal_{key}",
+              help=("Show account balances for this session"
+                    if hidden else "Hide account balances again"),
+              on_click=_toggle_reveal)
+
+
+def _toggle_reveal() -> None:
+    st.session_state[_REVEAL_KEY] = balances_masked()
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def _md(text) -> str:
+    """Escape a label for markdown — see ``format.md_escape``.
+
+    Leg and rule labels carry a strike ("AMD 2026-01-16 $150 PUT"), so a ticker
+    holding a put *and* a call put two ``$`` into one string and rendered its
+    two legs in visibly different type.
+    """
+    return md_escape(text)
+
 
 def _dte(expiration: str) -> int | None:
     try:
@@ -47,18 +118,40 @@ def _dte(expiration: str) -> int | None:
         return None
 
 
-def _held_legs() -> list | None:
-    """Every live option leg, or None when Schwab isn't connected/reachable.
+def _held_positions() -> list | None:
+    """Everything hideable — every live option leg AND every stock position —
+    or None when Schwab isn't connected or neither read succeeded.
 
-    Shares the Close/Roll tabs' 60s cache, so opening the dialog costs no extra
-    Schwab round-trip.
+    Both halves matter: hiding is per *symbol*, and a symbol you hold only
+    shares of (no options on it at all) was previously unpickable, because this
+    listed option legs only. Stock rows are normalized to carry `underlying` so
+    `position_filters` can match them with the same ticker-wide rule that hides
+    the legs, and tagged `asset="stock"` so the UI can label them as shares
+    rather than run them through `leg_label`.
+
+    Shares the Positions tab's 60s caches, so opening the dialog costs no extra
+    Schwab round-trip. A half-failed read still shows what it got: the rules for
+    the missing half are carried untouched by `split_rules_for_ui`, never
+    silently dropped.
     """
     scfg = st.session_state.get("schwab_config") or {}
     if not scfg.get("app_key"):
         return None
-    return positions_cache.option_positions(
-        scfg.get("app_key", ""), scfg.get("app_secret", ""),
-        scfg.get("callback_url", ""), scfg.get("token_file", ""))
+    args = (scfg.get("app_key", ""), scfg.get("app_secret", ""),
+            scfg.get("callback_url", ""), scfg.get("token_file", ""))
+    legs = positions_cache.option_positions(*args)
+    stocks = positions_cache.stock_positions(*args)
+    if legs is None and stocks is None:
+        return None
+    out = list(legs or [])
+    out += [{"underlying": str(s.get("ticker", "")).upper(),
+             "asset": "stock", "shares": s.get("shares", 0)}
+            for s in (stocks or [])]
+    return out
+
+
+def _is_stock(row: dict) -> bool:
+    return str(row.get("asset", "")).lower() == "stock"
 
 
 def _near_expiry_shorts(legs: list[dict]) -> list[dict]:
@@ -72,7 +165,7 @@ def _near_expiry_shorts(legs: list[dict]) -> list[dict]:
     return out
 
 
-# ── the notice shown on the Close and Roll tabs ──────────────────────────────
+# ── the notice shown on the Positions tab ──────────────────────────────
 
 def _show_key(scope: str) -> str:
     return f"_osc_show_hidden_{scope}"
@@ -108,7 +201,7 @@ def filter_hidden(legs: list[dict], *,
         st.warning(
             f"⚠️ {len(urgent)} hidden short position(s) expire within "
             f"{_NEAR_EXPIRY_DTE} days: "
-            + ", ".join(pf.leg_label(l) for l in urgent)
+            + ", ".join(_md(pf.leg_label(l)) for l in urgent)
             + ". Hidden positions are still live and still assignable.")
 
     showing = bool(st.session_state.get(_show_key(scope)))
@@ -118,7 +211,7 @@ def filter_hidden(legs: list[dict], *,
 def render_hidden_notice(hidden: list[dict], *, scope: str) -> None:
     """The "N hidden" note, its list, and the reveal toggle.
 
-    Called at the **bottom** of the Close and Roll tabs so it doesn't push the
+    Called at the **bottom** of the Positions tab so it doesn't push the
     positions table down; no-op when nothing is hidden. The toggle is
     session-only (never persisted — a peek must not quietly become the permanent
     state) and takes effect on the next rerun, which its own click triggers.
@@ -133,7 +226,7 @@ def render_hidden_notice(hidden: list[dict], *, scope: str) -> None:
         for leg in hidden:
             d = _dte(leg.get("expiration"))
             dte_txt = f" · {d}d to expiry" if d is not None else ""
-            st.markdown(f"- {pf.leg_label(leg)}{dte_txt}")
+            st.markdown(f"- {_md(pf.leg_label(leg))}{dte_txt}")
         st.checkbox("Show these in the table above (this session only)",
                     key=_show_key(scope))
         st.caption("Manage hidden positions in ⚙️ Settings, top right.")
@@ -142,8 +235,8 @@ def render_hidden_notice(hidden: list[dict], *, scope: str) -> None:
 # ── the dialog ───────────────────────────────────────────────────────────────
 
 def _render_hidden_positions(legs: list | None) -> None:
-    """The dialog's one section: choose which underlyings stay out of the Close
-    and Roll tables.
+    """The dialog's one section: choose which underlyings stay out of the
+    Positions table.
 
     Hiding is whole-position — one tick per underlying, covering every leg on it
     including ones opened later. (The rule format supports narrower matches and
@@ -160,7 +253,7 @@ def _render_hidden_positions(legs: list | None) -> None:
     by_key = {pf.rule_key(r): r for r in rules}
 
     st.caption(
-        "Hidden positions stay out of the **Close** and **Roll** tables. This "
+        "Hidden positions stay out of the **Positions** table. This "
         "is display only — the positions are still held, still assignable, and "
         "still count toward covered-call coverage and buying power.")
 
@@ -187,20 +280,29 @@ def _render_hidden_positions(legs: list | None) -> None:
         """Keep an existing rule's note/added_at so re-saving doesn't churn."""
         return dict(by_key.get(pf.rule_key(rule), rule))
 
-    # One tick per underlying — hiding is whole-position, not per-leg. The legs
-    # are listed read-only underneath so it's clear what each tick covers.
+    # One tick per SYMBOL — hiding is all-or-nothing across everything you hold
+    # on it, options and shares alike. What each tick covers is listed read-only
+    # underneath.
     if held_by_ticker:
-        st.markdown("**Your live option positions**")
+        st.markdown("**Your live positions**")
     wide_tickers = set()
     for ticker in sorted(held_by_ticker):
-        t_legs = held_by_ticker[ticker]
+        t_rows = held_by_ticker[ticker]
+        t_legs = [r for r in t_rows if not _is_stock(r)]
+        t_stock = [r for r in t_rows if _is_stock(r)]
+        # Say what the tick actually covers, so a shares-only symbol doesn't
+        # read as "hide all 0 leg(s)".
+        _shares = sum(float(s.get("shares", 0) or 0) for s in t_stock)
+        _bits = ([f"{len(t_legs)} leg(s)"] if t_legs else []) \
+            + ([f"{int(_shares):,} shares"] if _shares else [])
         t_rule = {"ticker": ticker}
         if st.checkbox(
-                f"**{ticker}** — hide all {len(t_legs)} leg(s)",
+                f"**{ticker}** — hide " + " + ".join(_bits or ["this symbol"]),
                 value=pf.rule_key(t_rule) in by_key,
                 key=f"osc_hide_all_{ticker}",
-                help="Keeps every leg on this underlying out of the Close and "
-                     "Roll tables, including ones you open later."):
+                help="Keeps this symbol out of the Positions tab entirely — "
+                     "every option leg and its shares, including legs you open "
+                     "later."):
             desired.append(_carry(t_rule))
             wide_tickers.add(ticker)
 
@@ -208,10 +310,14 @@ def _render_hidden_positions(legs: list | None) -> None:
         for leg in t_legs:
             d = _dte(leg.get("expiration"))
             covered = ("" if ticker in wide_tickers else next(
-                (f" — hidden by rule: {pf.rule_label(r)}"
+                (f" — hidden by rule: {_md(pf.rule_label(r))}"
                  for r in other_rules if pf.matches(r, leg)), ""))
-            lines.append(f"· {pf.leg_label(leg)}"
+            lines.append(f"· {_md(pf.leg_label(leg))}"
                          + (f" · {d}d" if d is not None else "") + covered)
+        if _shares:
+            # Stock never goes through `leg_label` — it has no strike, right or
+            # expiration, and would render as "PLNH ? — ?".
+            lines.append(f"· {int(_shares):,} shares")
         st.caption("  \n".join(lines))
 
     # Rules the tick above can't represent: narrower rules (hand-written, or
@@ -226,7 +332,7 @@ def _render_hidden_positions(legs: list | None) -> None:
             note = f" · {r['note']}" if r.get("note") else ""
             suffix = (f"matches {n} held leg(s)" if n
                       else "matches nothing you hold now")
-            if st.checkbox(f"{pf.rule_label(r)} — {suffix}{note}",
+            if st.checkbox(f"{_md(pf.rule_label(r))} — {suffix}{_md(note)}",
                            value=True, key=f"osc_keep_rule_{pf.rule_key(r)}",
                            help="Untick to delete this rule."):
                 desired.append(r)
@@ -238,14 +344,43 @@ def _render_hidden_positions(legs: list | None) -> None:
     if {pf.rule_key(r) for r in desired} != set(by_key):
         settings_store.set_hidden_positions(desired)
 
+
+def _render_privacy() -> None:
+    """The dialog's second section: mask account balances.
+
+    For screen-sharing and recording — the figures are on four order screens and
+    in the Sell dialog, and none of them are anyone else's business. Like hiding
+    positions this is display-only: sizing, coverage and affordability checks go
+    on reading the real numbers, so masking can never change what an order does.
+    """
+    masked = st.checkbox(
+        "Mask account balances", value=settings_store.get_mask_balances(),
+        key="osc_mask_balances",
+        help="Replaces cash and buying-power figures with ••••• everywhere "
+             "they appear. Order prices, position values and P/L still show — "
+             "this hides what's in the account, not what a trade costs.")
+    if masked != settings_store.get_mask_balances():
+        settings_store.set_mask_balances(masked)
+        # A stale session reveal would outrank the preference just set, so the
+        # new setting takes effect on the very next render rather than after a
+        # 👁 round-trip the user didn't ask for.
+        st.session_state.pop(_REVEAL_KEY, None)
+    st.caption("A 👁 button beside each masked figure reveals it for the "
+               "session only — this tick is what persists.")
+
+
+# on_dismiss="rerun" so closing with ✕ / Esc / a click outside applies the
+# changes like the Done button does. Streamlit's default ("ignore") runs nothing
+# on dismissal, which left the Positions table behind the dialog filtering
+# on the OLD rules until the user happened to click something else.
+@st.dialog("⚙️ Settings", width="large", on_dismiss="rerun")
+def _settings_dialog() -> None:
+    _render_hidden_positions(_held_positions())
+    st.divider()
+    _render_privacy()
     st.divider()
     if st.button("Done", key="osc_settings_done", type="primary"):
         st.rerun()  # closes the dialog; the tabs behind re-filter
-
-
-@st.dialog("⚙️ Settings", width="large")
-def _settings_dialog() -> None:
-    _render_hidden_positions(_held_legs())
 
 
 def render_settings_button() -> None:
@@ -260,9 +395,15 @@ def render_settings_button() -> None:
     has_err = bool(settings_store.get_errors(settings))
 
     if n:
-        label, tip = (f"⚙️ {n} hidden",
-                      f"{n} position(s) hidden from the Close and Roll tabs — "
-                      f"click to manage.")
+        # Just the count, not "N hidden": the gear is pinned beside the
+        # PAPER/LIVE badge, and a label that grows would push into it. The
+        # amber tint plus the tooltip carry the meaning.
+        # "symbol(s)", not "position(s)": each rule hides everything on one
+        # underlying — its option legs AND its shares — so the count is of
+        # symbols, and was already misleading when it read as positions.
+        label, tip = (f"⚙️ {n}",
+                      f"{n} symbol(s) hidden from the Positions tab (option "
+                      f"legs and shares alike) — click to manage.")
     elif has_err:
         label, tip = "⚙️ ⚠️", "Your settings file couldn't be read — click for " \
                               "details. Nothing is hidden."

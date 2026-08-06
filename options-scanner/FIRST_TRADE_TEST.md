@@ -7,9 +7,15 @@ without leaving the app.
 
 > **Real money, no Schwab sandbox.** When `paper = false`, this sends a
 > live order to your linked Schwab account. Sending always takes **two
-> clicks**: **Confirm Trade** only opens a review panel — nothing is
-> transmitted until you click **Place Trade** inside it. Start with
+> clicks**: **Confirm Trade** only arms the order — nothing is
+> transmitted until you click **Place Trade** beside it. Start with
 > **1 contract** on a **liquid** name you'd genuinely be fine owning.
+
+Selling a **covered call** works the same way — pick Calls instead of
+Puts on the Watchlist scan and the dialog becomes **Sell Call**, sized
+against the shares you hold rather than cash. And once you hold a leg,
+the **Positions** tab is where you close, roll, or unwind it; this guide
+covers opening and closing a trade the scanner placed.
 
 ## What a cash-secured put is
 
@@ -35,13 +41,17 @@ be happy to own, at a strike you'd be happy to pay.
 - [ ] **Schwab linked and authenticated.** The 7-day token must be
       fresh; if quotes are empty or you see "Couldn't resolve the target
       account," re-run `schwab_auth.py`.
-- [ ] **`paper = false`** in `options-scanner/config.toml`, then restart
-      the app — `paper = true` only *simulates* (Confirm records a fake
-      trade and sends nothing live). Keep it `true` if you'd rather
-      rehearse first (see "Rehearse risk-free" below).
+- [ ] **`paper = false`** in `options-scanner/config.toml` — `paper =
+      true` only *simulates* (Confirm records a fake trade and sends
+      nothing live). Keep it `true` if you'd rather rehearse first (see
+      "Rehearse risk-free" below). No restart needed: the file is re-read
+      on every rerun, so save it and click anything in the app
+      (`config.toml` isn't a watched source file, so saving alone won't
+      refresh the page). The title-bar badge flips **📝 PAPER** →
+      **🔴 LIVE** when it takes — check it before you trade.
 - [ ] **Schwab** selected as the data source. The toggle shows the token
       countdown; with `paper = false` the Sell Put dialog title shows
-      **🔴 LIVE**.
+      **🔴 LIVE** too.
 - [ ] **Market open** for live orders — equity options trade 9:30–16:00
       ET, Mon–Fri. **Confirm Trade** is disabled (with the reason)
       outside those hours.
@@ -67,10 +77,10 @@ can accept it or set your own.
 If this is genuinely your first time, prove out the mechanics before you
 commit real premium. Two ways:
 
-- **Paper mode** — set `paper = true`, restart, and run the whole flow.
-  Confirm records a simulated trade (no live order); the Trades tab shows
-  it tagged **PAPER**. Switch back to `paper = false` when you're ready
-  for real.
+- **Paper mode** — set `paper = true` and run the whole flow. Confirm
+  records a simulated trade (no live order); the Trades tab shows it
+  tagged **PAPER**. Switch back to `paper = false` when you're ready for
+  real, and watch the title-bar badge to confirm the switch took.
 - **A live order priced not to fill** — with `paper = false`, place
   **1 contract** with a limit credit set **well above the ask** (e.g.
   ~2–3× the mid, or a round number clearly above the ask — high enough
@@ -137,9 +147,12 @@ Once the order shows **✅ Broker order FILLED**, the close controls
 appear inline in the expanded trade:
 
 1. Set the **Close limit** (the debit per share you'll pay to buy it
-   back — it defaults to the current mid).
-2. Click **Place Closing Trade** → review the yellow **Confirm close —
-   BUY TO CLOSE …** panel → click **Confirm & Submit (LIVE)**.
+   back — it defaults to the current mid), and how many contracts to
+   close if you don't want all of them.
+2. Click **Confirm Closing Trade** — the same two-step gate as opening.
+   It arms the order against the numbers on screen (editing either one
+   disarms it) and reveals **Place Closing Trade**, which is what
+   actually sends the buy-to-close. Red **Cancel** backs out.
 3. The status flips to **closed**; verify the buy-to-close at your
    broker.
 
@@ -155,7 +168,8 @@ appear inline in the expanded trade:
   the broker.
 - **This is a real, cash-secured position** with assignment risk if it
   goes in-the-money. Keep it small and on a name you'd accept owning.
-- To go back to simulation, set `paper = true` and restart.
+- To go back to simulation, set `paper = true` — no restart; the badge
+  in the title bar tells you which mode is live.
 
 ## If something goes wrong
 

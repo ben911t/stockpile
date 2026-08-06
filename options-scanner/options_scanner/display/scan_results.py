@@ -182,11 +182,20 @@ def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
     # leaderboard). One key + open-guard per table so multiple tables (sides /
     # per-ticker expanders) don't collide.
     from options_scanner.display.leaderboard import (contract_from_row,
-                                                     open_investigate)
+                                                     open_investigate,
+                                                     rows_fingerprint)
     _word = "covered call" if opt_type == "call" else "cash-secured put"
     st.caption(f"🔍 **Select a {opt_type} row** to investigate writing a "
                f"{_word} — Schwab assisted trade (preview).")
-    _key = f"{investigate['key_prefix']}_{opt_type}"
+    # Row fingerprint in the key: a selection must not survive a filter change
+    # by row index, or the dialog reopens on whatever contract now sits at that
+    # index (see leaderboard.rows_fingerprint). The generation counter clears the
+    # selection after a dialog opens, so a dismissed dialog leaves the table
+    # ready to re-pick the same row. The guard below follows the key.
+    _gen_key = f"_inv_sel_gen_{investigate['key_prefix']}_{opt_type}"
+    _gen = int(st.session_state.get(_gen_key, 0))
+    _key = (f"{investigate['key_prefix']}_{opt_type}_"
+            f"{rows_fingerprint(sub)}_{_gen}")
     event = st.dataframe(styled, column_config=col_cfg, hide_index=True,
                          width="stretch", on_select="rerun",
                          selection_mode="single-row", key=_key,
@@ -205,11 +214,14 @@ def show_df(sub: pd.DataFrame, roll_close_cost: float | None = None,
         row, opt_type, investigate["ticker"],
         next_earnings=investigate.get("next_earnings"),
         spot_fallback=investigate.get("spot"))
-    open_investigate(
-        contract, ticker_df=investigate.get("ticker_df"),
-        min_oi=min_oi, top_n=int(investigate.get("top_n", 5)),
-        min_vol=min_vol, provider=investigate.get("provider", "schwab"),
-        guard_key=_guard)
+    if open_investigate(
+            contract, ticker_df=investigate.get("ticker_df"),
+            min_oi=min_oi, top_n=int(investigate.get("top_n", 5)),
+            min_vol=min_vol, provider=investigate.get("provider", "schwab"),
+            guard_key=_guard):
+        # Rebuild on the next full run (dismissing the dialog causes one) so the
+        # table returns with nothing selected.
+        st.session_state[_gen_key] = _gen + 1
 
 
 def show_scan_results(df: pd.DataFrame, mode: str, buy: bool,

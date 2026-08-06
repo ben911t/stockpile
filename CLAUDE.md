@@ -36,17 +36,44 @@ uv run streamlit run options-scanner/run_app.py
 ```
 
 Opens at `http://localhost:8501` with tabs for Single Ticker, Watchlist,
-Trades, Close, **Roll**, Portfolio, GEX, Spreads/Directional/Neutral, and
+**Positions**, Trades, Portfolio, GEX, Spreads/Directional/Neutral, and
 **Live Charts** (the trading dashboard, embedded). The **Trades** tab lists
-trades placed from the scanner; the **Close** tab manages live Schwab option
-positions (close all or part of a leg). The **Roll** tab is
-the only place that *places* a roll: it reads live short covered
-calls + short puts from your Schwab account and submits a
+trades placed from the scanner; the **Positions** tab manages every live
+Schwab option leg *and* the stock behind them. Select an option row and
+pick the action: **Close** (all or part of the leg), **Roll**, or
+**Unwind**. Close is the default. All three open on the same leg
+snapshot — bid/ask/mid, last with its print time, IV%, delta, OI, volume
+and IV+pp — so the contract reads the same whichever verb you pick;
+IV+pp costs a chain fetch (~2s, cached 5 min), which these panels can
+afford because they only render once a row is selected. Roll is offered
+only on legs that can be rolled (short puts, share-backed short calls);
+Unwind only on covered calls, since it buys the call back *and* sells
+the shares behind it as one net-credit order (both legs fill together or
+neither). A long or naked leg says why and offers the close builder.
+
+Below the legs, **Your Stock Positions** lists every share you hold,
+each row shaded by how much is written against it — uncovered, partly
+covered, covered, or **over-written** (more calls than shares to back
+them, the one risky state). Only positions with 100+ uncovered shares
+get a select checkbox; picking one opens a covered-call builder that
+scans that ticker and hands the chosen strike to the same **Sell Call**
+dialog the Watchlist uses.
+
+Positions is the only place that *places* a roll: it submits a
 buy-to-close + sell-to-open as one atomic net-price order (Schwab only;
 the Portfolio/Single "Roll" views stay analysis-only and point here).
-A **⚙️ Settings** gear (title bar, every tab) hides every option leg on
-chosen underlyings from the Close and Roll tables — display-only, and
-the gear reads "N hidden" whenever something is. Preferences persist in
+Placing is where it stops — a working roll is monitored and
+canceled on the **Trades** tab, listed as a `rolling` row with both
+legs' live quotes and the net available now vs the order's limit.
+
+The title bar carries a **📝 PAPER / 🔴 LIVE** badge (whenever Schwab is
+configured) so the order mode is visible on every tab, and a **⚙️
+Settings** gear beside it holding two display-only preferences: hide a
+chosen underlying from the Positions tab entirely — its option legs
+*and* its shares (the gear shows the hidden count, `⚙️ 3`) — and mask
+account balances behind
+`$•••••` everywhere they appear, with a 👁 button beside each masked
+figure that reveals them for the session only. Preferences persist in
 `options-scanner/settings/settings.json`; `config.toml` stays
 hand-edited and keeps the credentials and the `paper` flag.
 To launch the scanner **and** the dashboard together (so Live Charts is

@@ -23,13 +23,15 @@ options-scanner/watchlists/*.json
 # Brokerage CSV exports
 *.csv
 
-# Brokerage statement PDFs
-input/**/*.pdf
-input/*.pdf
-
-# Brokerage CSV backups
-input/**/*.bak
-input/*.bak
+# Brokerage exports, statements, and working notes — personal account data.
+# Ignore EVERYTHING dropped into input/, keeping only the few files the repo
+# ships. Previously just *.pdf and *.bak under here were ignored, so anything
+# else (e.g. input/one_off/444_TODO.md) turned up as a commit candidate even
+# though CLAUDE.md documents input/ as gitignored.
+input/*
+!input/.gitkeep
+!input/README.md
+!input/stockpile.csv.example
 
 # Logs
 *.log

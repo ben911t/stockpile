@@ -41,13 +41,14 @@ Set the callback URL to `https://127.0.0.1:8182/`.
   option chains — all the scanner itself needs. Safest choice: the
   resulting token cannot read your account or place orders even if it
   leaks.
-- **Accounts and Trading Production (optional).** Needed for the watchlist's
-  assisted put-selling feature (Sell mode → the **Sell Put** dialog), which
-  reads your **account balances** to size cash-secured puts and **can place
-  and close orders**. Placement is real but heavily gated — see "Live order
-  placement" below. Adding this product grants the token the ability to read
-  balances and place orders, so a leaked token is far more dangerous; skip it
-  unless you want that feature.
+- **Accounts and Trading Production (optional).** Needed for everything
+  that touches your account: the watchlist's **Sell Put** / **Sell Call**
+  dialogs (which read your **account balances** to size the trade), the
+  **Trades** tab's closing orders, and the whole **Positions** tab —
+  close, roll, unwind. Placement is real but heavily gated — see "Live
+  order placement" below. Adding this product grants the token the ability
+  to read balances and place orders, so a leaked token is far more
+  dangerous; skip it unless you want those features.
 
 > **Keep your App Key and App Secret private.** Anyone who has
 > them can make API calls on your behalf. Never commit them to
@@ -196,18 +197,20 @@ another machine won't work (it would stop after the first refresh). Your
   Your laptop only runs a browser for the login and stores nothing
   persistent.
 
-### Account info & assisted put-selling (optional)
+### Account info & assisted trading (optional)
 
-The watchlist leaderboard's **Sell Put** dialog (Sell mode + Schwab
-selected) shows your account balances and previews cash-secured put
-orders. It needs the **Accounts and Trading Production** product (step 1)
-on your app, in *Ready For Use* status, with your brokerage account linked
-to the app. Newly granted access can take until the next day to activate.
+The watchlist leaderboard's **Sell Put** / **Sell Call** dialogs (Sell
+mode + Schwab selected) show your account balances and preview the order,
+and the **Positions** tab lists every option leg and stock position you
+hold at Schwab. Both
+need the **Accounts and Trading Production** product (step 1) on your app,
+in *Ready For Use* status, with your brokerage account linked to the app.
+Newly granted access can take until the next day to activate.
 
 Until it's active, the scanner's market-data quotes keep working but
-account calls return **HTTP 401 "Client not authorized"**, and the dialog
-shows "Cash for puts unavailable". Check status anytime with the read-only
-diagnostic:
+account calls return **HTTP 401 "Client not authorized"**, the Sell dialog
+shows "Cash for puts unavailable", and the Positions tab has nothing to
+read. Check status anytime with the read-only diagnostic:
 
 ```bash
 uv run options-scanner/show_accounts.py
@@ -218,25 +221,37 @@ trading access is still pending.
 
 ### Live order placement
 
-The **Sell Put** dialog can place a real cash-secured put, and the
-**Trades** tab can buy it back to close. Real-money placement is gated four
-ways:
+Five screens can send a real order: the **Sell Put** and **Sell Call**
+dialogs (sell-to-open), the **Trades** tab's close (buy-to-close on a
+trade placed here), and the **Positions** tab's **Close**, **Roll** and
+**Unwind**. The Positions tab's stocks table can also start a covered
+call, but it hands off to that same **Sell Call** dialog rather than
+being a sixth path — every gate below applies to it unchanged.
+Real-money placement is gated four ways:
 
 1. **`paper` flag (config, default `true`).** This is the master arm switch.
    While `paper = true`, confirming records a *simulated* trade and sends
    **nothing** to Schwab. Set **`paper = false`** in `config.toml` to send
    live orders. A *live* open position can likewise only be closed with a
-   real order when `paper = false`.
-2. **Market hours.** Place Trade / Place Closing Trade are enabled only when
-   Schwab reports the equity-options market open (it stays disabled, and
-   says so, outside 9:30–16:00 ET on trading days, or if hours can't be
-   confirmed).
-3. **Two-step confirm.** Place Trade opens an inline review panel (order,
-   account, credit/collateral, LIVE/PAPER); nothing is sent until you click
-   **Confirm**.
-4. **Guardrails in code.** Single-leg, sell-to-open (or buy-to-close) puts
-   only; quantity/limit validated; collateral capped at your cash-secured
-   capacity; the order targets the specific linked account shown.
+   real order when `paper = false`; rolls and unwinds act on real positions
+   and are live-only by design (paper mode builds and prices them, but the
+   Confirm button stays disabled). The active mode shows as a
+   **📝 PAPER** / **🔴 LIVE** badge in the title bar on every tab.
+2. **Market hours.** The Confirm buttons are enabled only when Schwab
+   reports the equity-options market open (they stay disabled, and say so,
+   outside 9:30–16:00 ET on trading days, or if hours can't be confirmed).
+3. **Two-step confirm.** *Confirm…* only **arms** the order against the
+   exact values on screen (order, account, credit/collateral, LIVE/PAPER);
+   nothing is sent until you click *Place…*. Editing the limit or the
+   contract count — or switching between Close / Roll / Unwind — disarms it
+   back to Confirm, so Place can never apply to numbers you didn't confirm.
+4. **Guardrails in code.** Quantity and limit validated; collateral capped
+   at your cash-secured capacity; a covered call capped at the shares that
+   actually back it; an unwind refused if it would leave the remaining
+   calls naked. The roll (buy-to-close + sell-to-open) and the unwind
+   (buy-to-close + sell the shares) go out as **one atomic net-price
+   order** — both legs fill together or neither does. Every order targets
+   the specific linked account shown.
 
 There is **no Schwab paper/sandbox** for the API this tool uses (schwab-py
 talks only to production), so `paper = false` orders are real. Test the flow

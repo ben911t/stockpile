@@ -187,11 +187,19 @@ def test_rule_from_leg_round_trips_into_a_match():
 
 def test_rule_label_reads_as_what_it_covers():
     assert pf.rule_label({"ticker": "WPC"}) == "WPC — all legs"
-    assert pf.rule_label(pf.rule_from_leg(_leg())) == "UBER 2026-06-18 $120 C"
+    assert pf.rule_label(pf.rule_from_leg(_leg())) == "UBER 2026-06-18 $120 CALL"
     # A partial rule must not read like a single leg.
     assert "all matching legs" in pf.rule_label({"ticker": "UBER",
                                                  "option_type": "P"})
 
 
+def test_labels_spell_the_right_out():
+    # A bare "C"/"P" beside a strike is easy to misread when deciding what to
+    # hide, so both labels use the whole word.
+    assert pf.leg_label(_leg(opt="C")).split()[3] == "CALL"
+    assert pf.leg_label(_leg(opt="P")).split()[3] == "PUT"
+    assert pf.rule_label({"ticker": "UBER", "option_type": "P"}).count("PUT") == 1
+
+
 def test_leg_label_includes_quantity_and_direction():
-    assert pf.leg_label(_leg()) == "UBER 2026-06-18 $120 C ×2 short"
+    assert pf.leg_label(_leg()) == "UBER 2026-06-18 $120 CALL ×2 short"

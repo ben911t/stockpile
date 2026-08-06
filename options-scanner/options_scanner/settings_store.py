@@ -21,8 +21,12 @@ Gitignored — personal preferences, not shipped state.
 
 Schema (version 1):
   version           schema int, for future migrations
+  mask_balances     bool — hide account balance figures behind "•••••" wherever
+                    they're shown (default False). Display-only, like
+                    hidden_positions: nothing reads it to decide what an order
+                    can afford, so a mis-click can't change what a trade does.
   hidden_positions  match rules that hide live broker option legs from the
-                    Close and Roll tabs. Omitted fields are wildcards, so
+                    Positions tab. Omitted fields are wildcards, so
                     ``{"ticker": "WPC"}`` hides every WPC leg while
                     ``{"ticker": "UBER", "option_type": "C", "strike": 120.0,
                     "expiration": "2026-06-18"}`` hides exactly one leg:
@@ -55,11 +59,12 @@ SCHEMA_VERSION = 1
 
 # Keys the loader owns; anything else in the file is preserved untouched so a
 # newer version's settings survive a round-trip through an older build.
-_MANAGED_KEYS = ("version", "hidden_positions")
+_MANAGED_KEYS = ("version", "hidden_positions", "mask_balances")
 
 
 def _defaults() -> dict:
-    return {"version": SCHEMA_VERSION, "hidden_positions": []}
+    return {"version": SCHEMA_VERSION, "hidden_positions": [],
+            "mask_balances": False}
 
 
 def _normalize_rule(raw, errors: list[str]) -> dict | None:
@@ -155,6 +160,16 @@ def load() -> dict:
                       f"number — treating the file as version "
                       f"{SCHEMA_VERSION}.")
 
+    mask_raw = raw.get("mask_balances", False)
+    if isinstance(mask_raw, bool):
+        out["mask_balances"] = mask_raw
+    else:
+        # Anything else (a string "true", a number) is a hand-edit we won't
+        # guess at. Default to showing: a preference file that got mangled
+        # shouldn't leave you staring at "•••••" with no obvious cause.
+        errors.append(f"mask_balances isn't true/false ({mask_raw!r}) — "
+                      f"showing balances.")
+
     rules_raw = raw.get("hidden_positions", [])
     if not isinstance(rules_raw, list):
         errors.append("hidden_positions isn't a list — no positions are "
@@ -196,6 +211,21 @@ def get_hidden_positions(settings: dict | None = None) -> list[dict]:
     s = load() if settings is None else settings
     rules = s.get("hidden_positions", [])
     return list(rules) if isinstance(rules, list) else []
+
+
+def get_mask_balances(settings: dict | None = None) -> bool:
+    """Whether account balance figures are masked. Loads the file when not
+    given one already read this rerun."""
+    s = load() if settings is None else settings
+    return bool(s.get("mask_balances", False))
+
+
+def set_mask_balances(masked: bool) -> dict:
+    """Persist the balance-masking preference. Returns the reloaded settings."""
+    settings = load()
+    settings["mask_balances"] = bool(masked)
+    save(settings)
+    return load()
 
 
 def set_hidden_positions(rules: list[dict]) -> dict:

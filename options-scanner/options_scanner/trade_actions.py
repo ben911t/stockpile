@@ -210,13 +210,45 @@ class AccountCapacity:
 
     @property
     def amount(self) -> float | None:
-        """Cash that can secure a CSP: cash-account field, else a margin
+        """Funds that can secure a CSP: cash-account field, else a margin
         account's non-marginable funds, else plain available funds. Excludes
         margin buying power on purpose."""
         for v in (self.cash_available, self.non_marginable, self.available_funds):
             if v is not None:
                 return v
         return None
+
+    @property
+    def amount_field(self) -> str | None:
+        """Which Schwab balance `amount` came from. The UI labels the figure
+        with this: only the cash-account field is literally cash, so calling all
+        three "Avail Cash" overstated what a margin account has sitting there."""
+        if self.cash_available is not None:
+            return "cashAvailableForTrading"
+        if self.non_marginable is not None:
+            return "availableFundsNonMarginableTrade"
+        if self.available_funds is not None:
+            return "availableFunds"
+        return None
+
+    @property
+    def amount_label(self) -> str:
+        """Short label for `amount` — "Avail Cash" only when it really is cash."""
+        return ("Avail Cash"
+                if self.amount_field == "cashAvailableForTrading"
+                else "Avail Funds")
+
+    @property
+    def amount_note(self) -> str:
+        """One line saying what the figure is, for under the sizing readout."""
+        if self.amount_field == "cashAvailableForTrading":
+            return "Cash available for trading."
+        if self.amount_field == "availableFundsNonMarginableTrade":
+            return ("Schwab's *availableFundsNonMarginableTrade* — a margin "
+                    "account figure, not your cash balance.")
+        if self.amount_field == "availableFunds":
+            return "Schwab's *availableFunds* — not your cash balance."
+        return ""
 
 
 def fetch_account_capacity(client) -> AccountCapacity | None:
@@ -318,6 +350,121 @@ def _parse_option_symbol(symbol: str):
     return root, exp_iso, cp, strike
 
 
+COVERAGE_STATES = ("over_written", "uncovered", "partial", "covered")
+
+
+def classify_coverage(shares: float | None, short_calls: int) -> dict:
+    """How a stock position stands against the calls written on it.
+
+    Returns ``{state, lots, written, covered_shares, uncovered_shares,
+    coverable, naked_calls}``. ``state`` is one of:
+
+    * ``over_written`` — more short calls than 100-share lots. Part of the call
+      position is NOT backed by stock, so assignment forces a buy at market.
+      Called out separately because `calls_coverable` clamps at 0, which would
+      otherwise render this identically to a fully covered position.
+    * ``uncovered`` — no calls written against the shares.
+    * ``partial``    — some written, and a further 100-lot is still free.
+    * ``covered``    — written up to the last whole lot; nothing left to write.
+
+    "Covered" means no *writable* lot remains, not that every share is spoken
+    for: 450 shares against 4 calls leaves 50 shares unwritten, and there is
+    nothing you can do with 50 shares, so it reads as covered.
+
+    Pure arithmetic on two numbers so it can be tested without a broker.
+    """
+    try:
+        sh = max(0.0, float(shares or 0))
+    except (TypeError, ValueError):
+        sh = 0.0
+    try:
+        written = max(0, int(short_calls or 0))
+    except (TypeError, ValueError):
+        written = 0
+
+    lots = int(sh // 100)
+    coverable = max(0, lots - written)
+    naked_calls = max(0, written - lots)
+    covered_shares = min(written * 100, int(sh))
+    uncovered_shares = max(0, int(sh) - written * 100)
+
+    if naked_calls:
+        state = "over_written"
+    elif written == 0:
+        state = "uncovered"
+    elif coverable:
+        state = "partial"
+    else:
+        state = "covered"
+    return {"state": state, "lots": lots, "written": written,
+            "covered_shares": covered_shares,
+            "uncovered_shares": uncovered_shares,
+            "coverable": coverable, "naked_calls": naked_calls}
+
+
+def equity_positions(client, account_hash: str | None = None) -> list[dict]:
+    """Every stock position in the account, each with its covered-call standing.
+
+    ONE positions fetch (the same call the option readers make), so the shares
+    and the calls written against them can't come from two different reads of a
+    moving account. Read-only; [] on any failure.
+
+    Each entry carries the raw position (`ticker`, `shares`, `avg_price`,
+    `market_value`, `pl`) plus everything `classify_coverage` returns. Long
+    equity only — a short stock position can't back a call, and nothing here
+    would know what to do with one.
+    """
+    positions = _account_positions(client, account_hash)
+    if not positions:
+        return []
+    shares: dict[str, dict] = {}
+    calls: dict[str, int] = {}
+    for p in positions:
+        inst = p.get("instrument", {}) or {}
+        atype = str(inst.get("assetType", "")).upper()
+        if atype == "EQUITY":
+            tkr = str(inst.get("symbol", "")).upper()
+            qty = float(p.get("longQuantity", 0) or 0)
+            if not tkr or qty <= 0:
+                continue
+            rec = shares.setdefault(
+                tkr, {"shares": 0.0, "cost": 0.0, "market_value": 0.0,
+                      "pl": 0.0, "pl_known": False})
+            rec["shares"] += qty
+            # Weighted cost, so two lots of the same ticker average correctly.
+            rec["cost"] += qty * float(p.get("averagePrice", 0) or 0)
+            rec["market_value"] += float(p.get("marketValue", 0) or 0)
+            _pl = p.get("longOpenProfitLoss")
+            if _pl is not None:
+                rec["pl"] += float(_pl or 0)
+                rec["pl_known"] = True
+        elif (atype == "OPTION"
+              and str(inst.get("putCall", "")).upper() == "CALL"):
+            tkr = str(inst.get("underlyingSymbol", "")).upper()
+            if tkr:
+                calls[tkr] = calls.get(tkr, 0) + int(
+                    float(p.get("shortQuantity", 0) or 0))
+
+    out: list[dict] = []
+    for tkr, rec in shares.items():
+        qty = rec["shares"]
+        cov = classify_coverage(qty, calls.get(tkr, 0))
+        # Fall back to market value − cost when Schwab omits the P/L field;
+        # None (not 0) when neither is usable, so the column can stay blank
+        # rather than claiming the position is flat.
+        pl = rec["pl"] if rec["pl_known"] else (
+            rec["market_value"] - rec["cost"] if rec["market_value"] else None)
+        out.append({
+            "ticker": tkr,
+            "shares": qty,
+            "avg_price": (rec["cost"] / qty) if qty else 0.0,
+            "market_value": rec["market_value"],
+            "pl": pl,
+            **cov,
+        })
+    return sorted(out, key=lambda r: r["ticker"])
+
+
 def held_shares_and_short_calls_map(client, account_hash: str | None = None
                                     ) -> dict[str, dict]:
     """{TICKER: {"shares": float, "short_calls": int}} for every underlying with
@@ -350,7 +497,7 @@ def held_shares_and_short_calls_map(client, account_hash: str | None = None
 def open_option_positions(client, account_hash: str | None = None
                           ) -> list[dict]:
     """Every option leg held in the account, one entry per leg — the source for
-    the Roll tab. ONE positions fetch. Read-only; [] on any failure.
+    the roll builder. ONE positions fetch. Read-only; [] on any failure.
 
     Direction-agnostic on purpose (both short and long legs) so future
     long-option rolling reuses it without a rewrite. Each entry:
@@ -409,28 +556,39 @@ def open_option_positions(client, account_hash: str | None = None
     return legs
 
 
+def is_rollable(leg: dict) -> bool:
+    """Whether one held leg can be rolled: short covered calls + short puts.
+
+    A short call qualifies when the underlying is share-backed (>= 100 shares —
+    a covered-call program). We deliberately do NOT require every contract to be
+    individually covered: a ticker's several call legs share one share pool, and
+    each open leg must still be rollable. (The strict per-leg `covered` flag
+    double-counts that pool, so it must not gate this.) Truly naked calls — no
+    shares of the underlying — are excluded. All short puts qualify (treated as
+    cash-secured). Long legs are never rollable here: a roll replaces premium
+    you sold, and the Trades P/L model is credit-received.
+
+    The Positions tab asks this per row (to offer or refuse the Roll action) and
+    `rollable_positions` asks it of a whole account, so the rule has one home.
+    """
+    if str(leg.get("direction", "")).strip().lower() != "short":
+        return False
+    if str(leg.get("option_type", "")).upper() == "C":
+        try:
+            return float(leg.get("shares_held", 0) or 0) >= 100
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def rollable_positions(client, account_hash: str | None = None) -> list[dict]:
-    """Short covered calls + short puts held in the account — the Roll tab's
-    list — ONE entry per strike/expiration leg. A thin filter over
+    """Short covered calls + short puts held in the account — ONE entry per
+    strike/expiration leg. A thin filter (`is_rollable`) over
     `open_option_positions`; the general reader stays reusable for future
     long-option rolling. Read-only; [] on any failure.
-
-    A short call is included when the underlying is share-backed (>= 100 shares
-    — a covered-call program). We deliberately do NOT require every contract to
-    be individually covered: a ticker's several call legs share one share pool,
-    and each open leg must still be listed so the user can roll it. (The strict
-    per-leg `covered` flag double-counts that pool, so it must not gate the
-    list.) Truly naked calls — no shares of the underlying — are excluded. All
-    short puts are included (treated as cash-secured).
     """
-    out = []
-    for leg in open_option_positions(client, account_hash):
-        if leg["direction"] != "short":
-            continue
-        if leg["option_type"] == "C" and float(leg.get("shares_held", 0)) < 100:
-            continue
-        out.append(leg)
-    return out
+    return [leg for leg in open_option_positions(client, account_hash)
+            if is_rollable(leg)]
 
 
 def held_shares_and_short_calls(client, ticker: str,
@@ -788,6 +946,44 @@ def build_roll_order(*, ticker: str, option_type: str,
         quantity=int(quantity), net_limit=float(net_limit))
 
 
+def roll_net_quote(close_q: dict | None, open_q: dict | None) -> dict | None:
+    """What the market is paying for a roll *right now*, per share.
+
+    A roll buys back the held leg and sells the new one as one net order, so the
+    net you'd get depends on which side of each spread you cross:
+
+    * ``worst`` — sell the new leg at its **bid**, buy the old back at its
+      **ask**. What you'd collect crossing both spreads immediately.
+    * ``mid``   — both legs at their mids. The realistic fill estimate.
+    * ``best``  — new leg at its **ask**, old at its **bid**. Only if both
+      sides come to you.
+
+    Positive is a net credit, negative a net debit — the same sign convention as
+    the limit on the order, so ``mid`` vs that limit answers "is my price
+    reachable, or am I waiting for a move?".
+
+    None when either leg has no usable two-sided quote.
+    """
+    def _f(q, key):
+        try:
+            v = float((q or {}).get(key))
+        except (TypeError, ValueError):
+            return None
+        return v if v == v and v > 0 else None
+
+    c_bid, c_ask, c_mid = _f(close_q, "bid"), _f(close_q, "ask"), _f(close_q, "mid")
+    o_bid, o_ask, o_mid = _f(open_q, "bid"), _f(open_q, "ask"), _f(open_q, "mid")
+    if None in (c_bid, c_ask, o_bid, o_ask):
+        return None
+    if c_mid is None:
+        c_mid = (c_bid + c_ask) / 2
+    if o_mid is None:
+        o_mid = (o_bid + o_ask) / 2
+    return {"worst": round(o_bid - c_ask, 2),
+            "mid": round(o_mid - c_mid, 2),
+            "best": round(o_ask - c_bid, 2)}
+
+
 def place_roll_order(client, roll: RollOrder, account_hash: str) -> dict:
     """Submit a roll as ONE two-leg net-price order. LIVE.
 
@@ -819,6 +1015,165 @@ def place_roll_order(client, roll: RollOrder, account_hash: str) -> dict:
                                 int(roll.quantity))
                 .add_option_leg(OptionInstruction.SELL_TO_OPEN, open_sym,
                                 int(roll.quantity)))
+    except Exception as exc:  # noqa: BLE001 — bad date / build failure
+        return {"ok": False, "order_id": None, "error": str(exc)}
+    return _submit_spec(client, account_hash, spec)
+
+
+@dataclass
+class UnwindOrder:
+    """An unwind: buy-to-close a covered call **and** sell the shares backing it,
+    submitted as ONE net-price order so both legs fill together.
+
+    The whole point is atomicity. Closing the call and selling the stock as two
+    orders leaves a window where the call is gone and the shares aren't (or
+    worse, the shares are gone and the call is naked); as one net order Schwab
+    fills both or neither. A multi-contract order can still fill *partially* —
+    fewer contracts with proportionally fewer shares — so you can end up half
+    unwound, but never half a leg.
+
+    ``net_limit`` is the per-share net CREDIT: stock proceeds minus what the
+    buyback costs. Always positive for a covered call (a call can't be worth
+    more than the stock it's written on), so unlike a roll there's no sign to
+    carry. ``shares`` is 100 per contract — the ratio Schwab requires.
+    """
+
+    ticker: str
+    strike: float
+    expiration: str        # YYYY-MM-DD
+    quantity: int          # contracts to close
+    net_limit: float       # per-share net credit (stock − option)
+
+    @property
+    def shares(self) -> int:
+        """Shares sold alongside — 100 per contract."""
+        return int(self.quantity) * 100
+
+    @property
+    def net_amount(self) -> float:
+        """Total cash received if filled at ``net_limit``."""
+        return round(self.net_limit * 100 * self.quantity, 2)
+
+    def describe(self) -> str:
+        exp = datetime.strptime(self.expiration, "%Y-%m-%d").strftime("%b %d '%y")
+        return (f"UNWIND {self.quantity} {self.ticker} CALL "
+                f"${self.strike:g} {exp} + {self.shares} shares "
+                f"@ ${self.net_limit:.2f} net credit")
+
+
+def is_unwindable(leg: dict) -> bool:
+    """Whether a held leg can be unwound: a short call with the shares to sell.
+
+    Unwinding means "close the option and get out of the stock too", so it needs
+    both halves of a covered call. A cash-secured put has no shares behind it
+    (unwinding one is just closing it), and a long option isn't a position you
+    exit by selling stock — both get the plain Close builder instead.
+
+    Requires full share cover for the contracts held (100 each): with fewer
+    shares than that, some of the calls are naked and selling the shares would
+    leave them more so. Partial unwinds are still available inside the panel —
+    this gates whether the action is offered at all.
+    """
+    if str(leg.get("direction", "")).strip().lower() != "short":
+        return False
+    if str(leg.get("option_type", "")).upper() != "C":
+        return False
+    try:
+        return (float(leg.get("shares_held", 0) or 0)
+                >= 100 * int(leg.get("quantity", 0) or 0) > 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def build_unwind_order(*, ticker: str, strike: float, expiration: str,
+                       quantity: int, net_limit: float,
+                       shares_held: float) -> UnwindOrder:
+    """Validate and return an ``UnwindOrder`` (no placement).
+
+    Raises ``ValueError`` with a user-facing message on any violation. The share
+    check is the one that matters: selling more shares than are held would leave
+    the remaining calls uncovered, which is the opposite of what an unwind is
+    for. Mirrors ``build_roll_order``.
+    """
+    if int(quantity) < 1:
+        raise ValueError("quantity must be at least 1 contract")
+    if float(strike) <= 0:
+        raise ValueError("strike must be positive")
+    need = 100 * int(quantity)
+    if float(shares_held or 0) < need:
+        raise ValueError(
+            f"unwinding {int(quantity)} contract(s) sells {need} shares, but "
+            f"only {int(shares_held or 0)} are held")
+    if float(net_limit) <= 0:
+        raise ValueError("net limit must be a credit (stock proceeds exceed "
+                         "the cost to buy the call back)")
+    return UnwindOrder(ticker=str(ticker), strike=float(strike),
+                       expiration=str(expiration), quantity=int(quantity),
+                       net_limit=float(net_limit))
+
+
+def unwind_net_quote(stock_q: dict | None, option_q: dict | None) -> dict | None:
+    """What an unwind pays right now, per share — ``{worst, mid, best}``.
+
+    You sell stock and buy the call back, so the net depends on which side of
+    each spread you cross:
+
+    * ``worst`` — stock at its **bid**, call bought at its **ask**.
+    * ``mid``   — both at their mids. The realistic fill estimate.
+    * ``best``  — stock at its **ask**, call at its **bid**.
+
+    All three are credits (positive). None when either side lacks a usable
+    two-sided quote. Mirrors ``roll_net_quote``.
+    """
+    def _f(q, key):
+        try:
+            v = float((q or {}).get(key))
+        except (TypeError, ValueError):
+            return None
+        return v if v == v and v > 0 else None
+
+    s_bid, s_ask, s_mid = (_f(stock_q, "bid"), _f(stock_q, "ask"),
+                           _f(stock_q, "mid"))
+    o_bid, o_ask, o_mid = (_f(option_q, "bid"), _f(option_q, "ask"),
+                           _f(option_q, "mid"))
+    if None in (s_bid, s_ask, o_bid, o_ask):
+        return None
+    if s_mid is None:
+        s_mid = (s_bid + s_ask) / 2
+    if o_mid is None:
+        o_mid = (o_bid + o_ask) / 2
+    return {"worst": round(s_bid - o_ask, 2),
+            "mid": round(s_mid - o_mid, 2),
+            "best": round(s_ask - o_bid, 2)}
+
+
+def place_unwind_order(client, unwind: UnwindOrder, account_hash: str) -> dict:
+    """Submit an unwind as ONE two-leg net-credit order. LIVE.
+
+    One BUY_TO_CLOSE option leg and one SELL equity leg, priced NET_CREDIT, so
+    the option close and the share sale execute together — never one without the
+    other. Only ever called after the user's explicit confirm. Returns
+    {"ok", "order_id", "error"}.
+    """
+    if unwind.quantity < 1 or unwind.strike <= 0 or unwind.net_limit <= 0:
+        return {"ok": False, "order_id": None, "error": "invalid order"}
+    try:
+        from schwab.orders.generic import OrderBuilder
+        from schwab.orders.common import (
+            Duration, EquityInstruction, OptionInstruction, OrderStrategyType,
+            OrderType, Session,
+        )
+        sym = _osi(unwind.ticker, unwind.strike, unwind.expiration, "C")
+        spec = (OrderBuilder()
+                .set_session(Session.NORMAL)
+                .set_duration(Duration.DAY)
+                .set_order_type(OrderType.NET_CREDIT)
+                .set_order_strategy_type(OrderStrategyType.SINGLE)
+                .set_price(f"{unwind.net_limit:.2f}")
+                .add_option_leg(OptionInstruction.BUY_TO_CLOSE, sym,
+                                int(unwind.quantity))
+                .add_equity_leg(EquityInstruction.SELL, unwind.ticker,
+                                int(unwind.shares)))
     except Exception as exc:  # noqa: BLE001 — bad date / build failure
         return {"ok": False, "order_id": None, "error": str(exc)}
     return _submit_spec(client, account_hash, spec)

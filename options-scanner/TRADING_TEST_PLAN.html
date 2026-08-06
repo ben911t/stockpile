@@ -172,7 +172,7 @@
         <span class="chip ok">Success <b id="c-ok">0</b></span>
         <span class="chip fail">Fail <b id="c-fail">0</b></span>
         <span class="chip no">Not tested <b id="c-no">0</b></span>
-        <span class="chip total">of <b id="c-total">35</b></span>
+        <span class="chip total">of <b id="c-total">60</b></span>
       </div>
       <span class="spacer"></span>
       <div class="actions">
@@ -186,7 +186,7 @@
       <div class="seg-ok" id="seg-ok"></div>
       <div class="seg-fail" id="seg-fail"></div>
     </div>
-    <div class="progress-label" id="prog-label">0 of 35 tested</div>
+    <div class="progress-label" id="prog-label">0 of 60 tested</div>
   </div>
 
   <details class="pre">
@@ -241,18 +241,20 @@ const DATA = [
       {id:'C8', todo:'Close a live position while app is in paper mode', mode:'Paper', exp:'Blocked with "live position can\'t be closed in paper mode" note'},
       {id:'C9', todo:'Cancel (discard paper trade)', mode:'Paper', exp:'A third button beside the paper trade close controls. Marks the record canceled and books NO close and no P/L (a trade you decided against is not a closed trade); toast "Paper trade canceled". Remove from Tracker still deletes the record outright.'},
     ]},
-  { id:'D', title:'D. Roll a position — Roll tab',
-    desc:'Roll tab (Schwab). A roll acts on a REAL position, so PLACING one needs paper=false — in paper mode the tab can only build and price a roll (that is D5, the one row in the Paper pass). Select a rollable position → build → select a target row → confirm dialog → Place Roll.',
+  { id:'D', title:'D. Roll a position — Positions tab',
+    desc:'Positions tab (Schwab). Select a position, switch the action to Roll. A roll acts on a REAL position, so PLACING one needs paper=false — in paper mode you can only build and price a roll (that is D5, the one row in the Paper pass). Select a rollable position → Roll → build → select a target row → confirm dialog → Place Roll.',
     rows:[
-      {id:'D1', todo:'Roll a short covered call to a new strike/expiry', mode:'Live', exp:'Net-price order sent; row shows under In-flight rolls as rolling; new leg appears on fill'},
+      {id:'D1', todo:'Roll a short covered call to a new strike/expiry', mode:'Live', exp:'Net-price order sent; the banner says to watch it on the Trades tab. This tab only places — it shows a one-line "N roll(s) working" pointer, no monitoring. On the Trades tab the roll is a "rolling" row headed "$150 → $160"; expanding it shows both legs bid/ask/mid, the net available now vs your limit, and the broker status. New leg becomes a normal position on fill, from whichever tab you are on.'},
       {id:'D2', todo:'Roll a short put', mode:'Live', exp:'Same as D1 for the put'},
-      {id:'D3', todo:'Cancel an in-flight roll', mode:'Live', exp:'Cancel roll → original position unchanged; record cleared'},
-      {id:'D4', todo:'Roll order terminates unfilled (expire/reject)', mode:'Live', exp:'One-time note; original position restored; no phantom trade'},
-      {id:'D5', todo:'Open Roll tab in paper mode', mode:'Paper', exp:'Warning that placing needs paper=false; can build/price only'},
+      {id:'D3', todo:'Cancel an in-flight roll (from the Trades tab)', mode:'Live', exp:'Cancel roll → original position unchanged; record cleared. Cancel lives on the Trades-tab row; the Positions tab no longer offers it.'},
+      {id:'D4', todo:'Roll order terminates unfilled (expire/reject)', mode:'Live', exp:'One-time note; original position restored; no phantom trade. Settles from whichever tab is open (Trades or Positions), not only while the roll builder is showing.'},
+      {id:'D5', todo:'Open the Roll action in paper mode', mode:'Paper', exp:'Warning that placing needs paper=false; can build/price only'},
       {id:'D6', todo:'Selecting a row scrolls the roll detail into view', mode:'Either', exp:'Page scrolls so the expanded detail is visible'},
+      {id:'D7', todo:'Action switch: Close ↔ Roll on a selected position', mode:'Either', exp:'Panel opens on Close. Switching to Roll builds the roll for the SAME leg; switching back returns to the close builder. Switching away from an ARMED close disarms it — coming back shows Confirm again, never a live Place button armed under the other action.'},
+      {id:'D8', todo:'Roll offered only where it applies', mode:'Either', exp:'A long leg and a naked short call (no 100 shares) show no action switch — just the close builder and one line saying why rolling is unavailable. Short puts and share-backed short calls offer both.'},
     ]},
-  { id:'E', title:'E. Close Options (Schwab) — Close tab',
-    desc:'Close tab → Close Options (Schwab) table (all live legs). Select a row → close builder → Confirm Close → Place Close.',
+  { id:'E', title:'E. Close a position — Positions tab',
+    desc:'Positions tab → Your Option Positions (Schwab) table (all live legs). Select a row → close builder (the default action) → Confirm Close → Place Close.',
     rows:[
       {id:'E1', todo:'Close an untracked short call/put (full)', mode:'Live', exp:'BUY_TO_CLOSE sent; a closing record appears under Trades; finalizes to closed with REALIZED P/L on fill'},
       {id:'E2', todo:'Partial close of an untracked short', mode:'Live', exp:'Only N contracts close; the rest stays at the broker (still in this table)'},
@@ -261,7 +263,8 @@ const DATA = [
       {id:'E5', todo:'Re-select a leg that already has a working close', mode:'Live', exp:'Blocked: "⏳ A closing order is already working…" (no duplicate order)'},
       {id:'E6', todo:'Open the section in paper mode', mode:'Paper', exp:'Table renders read-only; close builder shows "needs paper=false"'},
       {id:'E7', todo:'Untracked close terminates unfilled', mode:'Live', exp:'Record dropped (no phantom open trade); position unchanged in the table'},
-      {id:'E8', todo:'Verify table columns', mode:'Either', exp:'Type = "Put - Short"; live Delta; Ann% (remaining time value); Spot/Day% colored green/red'},
+      {id:'E9', todo:'Close panel shows the leg snapshot', mode:'Either', exp:'Selecting a row opens Close with a table — Spot, Bid, Ask, Mid, Last (with its ET print time), IV%, Delta, OI, Vol, IV+pp — not the old one-line quote. Laid out two pairs per line to keep it short: prices run down the left column, IV%/Delta/OI/Vol/IV+pp down the right. Same rows, same order and same colors as the Roll and Unwind panels for the same leg. IV+pp costs a chain fetch (~2s, spinner) on the first open of a ticker and is cached 5 min, so switching Close/Roll/Unwind or editing the limit is instant; a throttled chain drops just that row and closing still works.'},
+      {id:'E8', todo:'Verify table columns', mode:'Either', exp:'Puts and Calls are separate tables, puts first, each headed with its count. Direction = Short/Long (the right is in the heading); live Delta; Ann% (remaining time value, annualized); Intrinsic | Time = the two halves of the leg value, whole-leg — nearly all intrinsic when deep ITM; Mkt Val negative for a short; P/L green when in your favor, red against, for shorts AND longs. Spot/Day% colored green/red. Rows are shaded and ordered by ITM% (furthest out of the money first); Open (stock · option) shows what the underlying and the option cost at open, blank for legs opened outside the scanner; DTE carries days-open in parens. Selecting a row in either table opens the close builder for THAT leg. Every column has a tooltip.'},
     ]},
   { id:'F', title:'F. Cross-cutting safety & gating',
     desc:'',
@@ -270,7 +273,36 @@ const DATA = [
       {id:'F2', todo:'Two-step confirm on every action', mode:'Either', exp:'No order is sent on the first (Confirm…) click — only the Place… button in the panel sends'},
       {id:'F3', todo:'Cancel on any confirm panel', mode:'Either', exp:'Cancel collapses the panel on the first click; nothing sent'},
       {id:'F4', todo:'Expired Schwab token mid-session', mode:'Either', exp:'Re-auth hint / "re-run schwab_auth.py"; no crash'},
-      {id:'F5', todo:'Switching data source to Yahoo', mode:'Either', exp:'Trade/Roll/Close sections show "connect Schwab" notices; no order paths exposed'},
+      {id:'F5', todo:'Switching data source to Yahoo', mode:'Either', exp:'The Positions tab shows a "connect Schwab" notice; on the Trades tab, expanding a trade explains that live cost-to-close / P/L / order status / closing are Schwab-only and to switch the data source back (or, with no credentials at all, to set Schwab up). No live order paths exposed — a paper trade can still be closed in the tracker, which sends nothing.'},
+      {id:'F7', todo:'Broker tabs are filled Schwab blue in the tab bar', mode:'Either', exp:'The whole Positions and Trades chips are filled Schwab blue (#00A0DF), not just a box behind the label; every other tab (including Live Charts) is plain. Selecting one turns it solid #0077A8 with a white label — READ THE LABEL on the selected tab in BOTH light and dark themes, that is the contrast bug this replaced (a translucent active fill left white-on-pale-blue at 2:1 on the light theme only). Hovering the tab bar explains that blue tabs need Schwab configured AND selected.'},
+      {id:'F6', todo:'Mask account balances (⚙️ Settings)', mode:'Either', exp:'Every account figure reads $••••• — the buying-power line on the Positions table, both close builders and the roll dialog, plus the Sell dialog available-funds line and Account info panel. Order prices, collateral, position values and P/L still show. The 👁 button reveals them everywhere for the session only; the tick is what persists. Sizing and affordability still use the real numbers — a max-size order builds the same masked or not.'},
+    ]},
+  { id:'G', title:'G. Unwind a covered call — Positions tab',
+    desc:'Positions tab → select a covered call → Unwind. Closes the option AND sells the shares behind it as ONE net-credit order, so both legs fill together. Needs paper=false and an open market.',
+    rows:[
+      {id:'G1', todo:'Unwind a covered call in full', mode:'Live', exp:'One NET_CREDIT order with TWO legs — buy-to-close the calls and sell 100 shares per contract. Both fill together or neither; the position and the shares go at once. Appears on the Trades tab as a closing record and finalizes on fill.'},
+      {id:'G2', todo:'Partial unwind', mode:'Live', exp:'1 of 2 contracts unwinds 1 call + 100 shares; the rest of the position AND the remaining shares stay. The panel says how many shares are left untouched.'},
+      {id:'G3', todo:'Unwind offered only on covered calls', mode:'Either', exp:'Covered call → Close / Roll / Unwind. Short put → Close / Roll only (no shares behind it). Naked or under-covered call (fewer than 100 shares per contract) and any long leg → no Unwind.'},
+      {id:'G4', todo:'Size larger than the share cover is refused', mode:'Either', exp:'Typing more contracts than the shares cover shows "unwinding N contract(s) sells X shares, but only Y are held" and refuses to arm — it must never leave the remaining calls naked.'},
+      {id:'G5', todo:'Unwind in paper mode', mode:'Paper', exp:'Warning that it sends a real order; Confirm disabled. Nothing sent.'},
+      {id:'G7', todo:'Time value shown under the balances', mode:'Either', exp:'⏳ Time value line reads $X/share, the whole-leg dollars, and a %/yr annualized against spot — matching the Ann% column for the same leg. Zero for a call trading at or below intrinsic. The %/yr drops (dollars stay) on an expiring leg. No line at all when either quote is missing.'},
+      {id:'G6', todo:'Net credit matches the two legs', mode:'Either', exp:'Net now = stock mid − option mid, with the crossing-both-spreads and both-sides-come-to-you bounds either side. Total = net × 100 × contracts.'},
+      {id:'G8', todo:'Per-leg detail matches the roll', mode:'Either', exp:'Both legs are laid out two pairs per line (prices left, the rest right). Call leg shows Bid/Ask/Mid/Last (with its ET print time)/IV%/Delta/OI/Vol/IV+pp — the same snapshot the roll confirm panel gives, IV+pp last and colored by sign. Share leg shows Bid/Ask/Mid/Last, Mark when it differs from the midpoint, plus Day% (green up / red down, one decimal, matching the Spot column) and Vol; it has no OI, IV or IV+pp row. A missing quote shows em dashes, never $0.00. IV+pp costs a chain fetch (~2s, spinner, cached 5 min) — a throttled or empty chain just drops that one row and the unwind still prices and places.'},
+    ]},
+  { id:'H', title:'H. Stock positions & covered-call builder — Positions tab',
+    desc:'Positions tab, below the option legs. Every share you hold, shaded by how much is written against it, and a builder to sell a call on what is free.',
+    rows:[
+      {id:'H1', todo:'Only writable rows are selectable', mode:'Either', exp:'Positions with 100+ uncovered shares come first WITH a select checkbox. Everything else - fully covered, an odd lot, over-written - sits below under "Nothing to write" with NO checkbox, same columns and shading. Selecting a row there must be impossible. With nothing writable at all, the top table is replaced by a plain notice.'},
+      {id:'H1b', todo:'Coverage states and shades', mode:'Either', exp:'Each row shaded by state: Uncovered (sky, a free 100-lot), Partly covered (yellow), Covered (slate, written to the last whole lot), Over-written (red). Legend under the table matches. An uncovered odd lot (<100 sh) is UNSHADED - uncovered but nothing to act on. Columns: Shares / Written / Uncovered / Can write, plus Spot, Avg cost, Mkt Val, P/L.'},
+      {id:'H2', todo:'Covered means no writable lot left', mode:'Either', exp:'450 shares with 4 calls reads Covered with Uncovered=50 and Can write=0 - NOT partly covered. There is nothing you can do with 50 shares.'},
+      {id:'H3', todo:'Over-written is called out', mode:'Either', exp:'A ticker with more calls than 100-share lots (e.g. 150 sh, 2 calls) shades red, reads Over-written, and a warning above names it and the naked count. It must NOT read as covered - that was the bug the state exists to prevent.'},
+      {id:'H4', todo:'Build a covered call from a stock row', mode:'Either', exp:'With BOTH tables on screen, select a row in the writable one and confirm the builder names THAT ticker - the two tables are separate frames, so an index mix-up would open the wrong position. Builder opens naming the uncovered shares and max contracts. Set filters, Scan calls -> candidates ranked by IV+pp with a Credit column for the full coverable size. Picking one opens the same Sell Call dialog the Watchlist uses, capped at what the shares cover.'},
+      {id:'H4b', todo:'Builder leads with spot and day change', mode:'Either', exp:'Under the "Sell a covered call - TICKER" heading, a line reads "spot $X +Y%" - green on an up day, red on a down day, and PLAIN (not green) when no day change is available. It sits above the filters, since where the stock is decides which strikes are worth scanning. No spot at all -> the line is dropped, not shown as a dash.'},
+      {id:'H5', todo:'Builder filters', mode:'Either', exp:'Min OI, Min Vol, Min/Max DTE, |Delta| band, Min/Max Strike - same set and order as the roll builder. Each one narrows the scanned candidates; clearing Max DTE or either strike box means no limit. Min Strike is how you keep assignment above your cost basis (the tooltip names it); there is no separate cost-basis tick. Min Vol above 0 empties the table while the market is closed, and the empty-state says so.'},
+      {id:'H6', todo:'Rows with nothing to write refuse politely', mode:'Either', exp:'Selecting a fully covered row, an odd lot, or an over-written one explains why rather than opening a builder - and the over-written case points at closing or rolling a call first.'},
+      {id:'H7', todo:'Hiding is per symbol, shares included', mode:'Either', exp:'Settings offers EVERY symbol you hold - including one you hold only shares of, with no options on it at all (that was previously unpickable). The tick label says what it covers ("2 leg(s) + 400 shares", or just "1,500 shares"), never "0 leg(s)", and a shares-only symbol must not render as "TICKER ? - ?". Ticking it removes the shares here AND any legs above. A narrower rule (one strike / all puts) must NOT hide the stock row.'},
+      {id:'H7b', todo:'Hidden notice for a shares-only symbol', mode:'Either', exp:'Hide a symbol you hold no options on: the stocks table names it in its own caption pointing at Settings. It must NOT point at the option table's "Hidden positions" expander, which does not render when no option leg is hidden. Only ONE such expander ever appears on the tab (a second is a duplicate-key crash). Re-open Settings and the rule is still a TICK, not exiled to "Other rules".'},
+      {id:'H8', todo:'No stock, or Schwab unreachable', mode:'Either', exp:'No stock -> plain caption, no empty table. Token expired -> the re-auth warning, not a blank section.'},
     ]},
 ];
 

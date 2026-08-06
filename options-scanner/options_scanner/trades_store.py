@@ -17,16 +17,26 @@ Each record:
   paper       bool — placed in Schwab paper/sandbox
   order_id    Schwab order id (None until placement is wired)
   opened_at   ISO-8601 timestamp
+  filled_at   ISO-8601 when the opening order was first seen FILLED. Recorded
+              once so "did it fill?" stops needing a Schwab read: the Trades
+              tab polls order status only for orders still unresolved, and a
+              collapsed row can say "open" and mean it. Absent on a paper trade
+              (no broker order) and on records that predate this field.
   close_order_id  Schwab id of the buy-to-close order (set while "closing")
   close_limit_px  per-share limit on that closing order
   close_qty   contracts the working closing order is buying back (≤ quantity)
+  unwind_shares   present when the close is an UNWIND — the option buyback and
+              this many shares went out as one net-credit order, so the record
+              describes both legs. Only the option leg's P/L is booked: the
+              trade log models premium received and holds no cost basis for the
+              stock, so the share sale's gain/loss lives at the broker
   close_cost  per-share cost paid to close (None while open)
   closed_at   ISO-8601 (None while open)
   fill_spot   underlying spot captured at fill (paper: at placement)
   fill_delta  option delta captured at that same moment
   fill_iv     option implied vol captured at that same moment
 
-Roll lifecycle (Roll tab — an atomic buy-to-close + sell-to-open net order):
+Roll lifecycle (Positions tab — an atomic buy-to-close + sell-to-open net order):
   roll_order_id  Schwab id of the working net-price roll order (while "rolling")
   roll_net_px    signed per-share net limit (+ = net credit, − = net debit)
   rolled_at      ISO-8601 when the roll filled / was recorded

@@ -12,7 +12,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 import streamlit as st
 
@@ -29,27 +29,19 @@ except Exception:  # pragma: no cover - shields against Streamlit layout drift
 from options_scanner import (
     confirm_gate, positions_cache, settings_ui, trade_actions, trades_store,
 )
-from options_scanner.ui_theme import df_height, metric_card, section_header
+from options_scanner.format import (
+    days_since, dte_cell, kv_table_html, leg_rows, money_md,
+    open_prices_cell,
+)
+from options_scanner.ui_theme import (
+    df_height, metric_card, scroll_into_view, section_header,
+)
 
 # Max wall-clock the Trades tab waits for all per-trade Schwab reads (order
 # status + cost-to-close re-quote), which run in parallel. A slower or hung
 # call past this leaves that trade's data unavailable rather than freezing the
 # tab. Kept under the client's own HTTP timeout (SCHWAB_HTTP_TIMEOUT_S).
 _TRADES_FETCH_TIMEOUT_S = 8.0
-
-
-def _kv_table_html(rows: "list[tuple[str, str]]") -> str:
-    """Borderless key/value HTML table — matches the Sell Put snapshot. ($ is
-    safe here: inside raw HTML it's not parsed as LaTeX.)"""
-    cells = "".join(
-        "<tr>"
-        f"<td style='padding:4px 14px;color:#808495'>{f}</td>"
-        f"<td style='padding:4px 14px;font-variant-numeric:tabular-nums'>{v}</td>"
-        "</tr>"
-        for f, v in rows
-    )
-    return ("<table style='border-collapse:collapse;font-size:1rem'>"
-            f"{cells}</table>")
 
 
 def _fmt_spot_day(spot, pct):
@@ -184,6 +176,137 @@ def _close_quote(app_key: str, app_secret: str, callback_url: str,
         return None
     return trade_actions.requote_option(client, ticker, expiration, strike,
                                         option_type=option_type)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _equity_quote(app_key: str, app_secret: str, callback_url: str,
+                  token_file: str, ticker: str) -> dict | None:
+    """Cached (30s) read-only quote for one stock, or None.
+
+    The sell leg of an unwind. A stock needs a real two-sided quote for the same
+    reason the option does — the net credit is the difference between them, so
+    pricing off a last trade would misstate what the package is worth. `mid` is
+    Schwab's mark when it gives one, else the bid/ask midpoint.
+
+    Returns ``{bid, ask, mid, mark, last, volume, pct_change}``.
+
+    ``mid`` is the true bid/ask midpoint, and Schwab's ``mark`` is reported
+    separately rather than substituted for it. They are not the same number —
+    on a liquid stock the mark tracks the last trade and can sit cents off the
+    midpoint (bid 376.94 / ask 377.07 → mid 377.005, mark 376.95). Conflating
+    them broke `unwind_net_quote`'s bracket: it prices `worst`/`best` off the
+    raw bid and ask, so a `mid` taken from the mark wasn't the center of the
+    two numbers the panel shows it between.
+
+    volume/pct_change ride along free on the same response and let the unwind
+    panel show what the shares are doing today — whether you're selling into
+    strength or weakness — beside what they're worth. Everything but bid/ask is
+    None-able; only bid/ask are load-bearing (no two-sided market → None, and
+    the caller can't price the unwind).
+    """
+    from stocks_shared.schwab_live import get_client
+    try:
+        client = get_client(app_key, app_secret, callback_url, token_file)
+        resp = client.get_quote(ticker)
+        if resp.status_code != 200:
+            return None
+        q = (resp.json().get(ticker) or {}).get("quote") or {}
+    except Exception:
+        return None
+
+    def _f(key):
+        try:
+            v = float(q.get(key))
+        except (TypeError, ValueError):
+            return None
+        return v if v == v and v > 0 else None
+
+    bid, ask = _f("bidPrice"), _f("askPrice")
+    if bid is None or ask is None:
+        return None
+    # The midpoint, computed — never Schwab's mark standing in for it. See the
+    # docstring: the mark is a different number and callers price against the
+    # spread, so substituting it silently decentered the net-credit bracket.
+    mid = round((bid + ask) / 2, 4)
+
+    # Day context, best-effort. `_f` rejects non-positive values, which is right
+    # for prices but would silently drop a down day and a zero-volume session,
+    # so these two parse straight.
+    def _raw(key):
+        try:
+            v = float(q.get(key))
+        except (TypeError, ValueError):
+            return None
+        return v if v == v else None
+
+    _vol = _raw("totalVolume")
+    return {"bid": bid, "ask": ask, "mid": mid, "mark": _f("mark"),
+            "last": _f("lastPrice"),
+            "volume": int(_vol) if _vol is not None else None,
+            "pct_change": _raw("netPercentChange")}
+
+
+def held_iv_pp(df, pos: dict) -> float | None:
+    """IV+pp of the held leg, read out of an already-fitted chain frame.
+
+    The comparison only means something when the number comes from the same
+    surface fit as whatever it's shown beside — an IV+pp from a separate fetch
+    is measured against a differently-fitted surface. None when the contract
+    isn't in the chain (expired, or a strike the provider no longer lists) or
+    has no fitted value.
+    """
+    try:
+        side = "call" if pos.get("option_type") == "C" else "put"
+        if df is None or "iv_excess" not in getattr(df, "columns", []):
+            return None
+        m = df[(df["type"] == side)
+               & (df["expiration"] == str(pos.get("expiration")))
+               & ((df["strike"] - float(pos.get("strike"))).abs() < 1e-6)]
+        if m.empty:
+            return None
+        v = float(m["iv_excess"].iloc[0]) * 100.0
+        return v if v == v else None       # NaN → unknown
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def leg_iv_pp(pos: dict, ticker: str, provider: str,
+              scfg: dict) -> float | None:
+    """IV+pp for one held leg, fetching and fitting a chain to get it.
+
+    Every other figure on a leg snapshot rides along on the re-quote; this one
+    doesn't exist in a quote, so it costs a chain read (~2s measured — the fit
+    itself is ~4ms) behind `fetch_and_enrich`'s 5-minute cache. Only the first
+    render of a given ticker pays; reruns from editing a limit or a size are
+    free, as is switching between Close, Roll and Unwind on the same position.
+
+    The fetch window runs from 0 DTE to past the held leg, because the surface
+    is fitted across expirations — pulling only the leg's own expiration would
+    leave nothing to fit against. Narrowing it saves nothing anyway: the cost is
+    the round-trip, not the row count.
+
+    Never raises. IV+pp is context, not a precondition for placing an order, so
+    a throttled or empty chain drops the row rather than blocking the panel.
+    """
+    from options_scanner.fetch import fetch_and_enrich
+    try:
+        held_dte = (datetime.strptime(str(pos.get("expiration", "")),
+                                      "%Y-%m-%d").date() - date.today()).days
+    except (TypeError, ValueError):
+        return None
+    if held_dte < 0:
+        return None
+    opt_key = "calls" if pos.get("option_type") == "C" else "puts"
+    try:
+        with st.spinner(f"Fitting {ticker}'s IV surface…"):
+            df, _earn, err = fetch_and_enrich(
+                ticker, opt_key, 0, max(400, held_dte + 1), provider=provider,
+                schwab_config=scfg)
+        if err or df is None or df.empty:
+            return None
+        return held_iv_pp(df, pos)
+    except Exception:  # noqa: BLE001 — provider/SDK errors are all non-fatal
+        return None
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -367,7 +490,7 @@ def _settle_closing_trade(t: dict, cbs: "dict | None") -> "tuple[bool, str|None]
     if _external:
         trades_store.remove(t["id"])
         return True, (f"Closing order {_cstat} without filling — the position is "
-                      "unchanged at your broker (see the **Close** tab).")
+                      "unchanged at your broker (see the **Positions** tab).")
     trades_store.update(t["id"], status="open", close_order_id=None,
                         close_limit_px=None, close_qty=None)
     return True, (f"Closing order {_cstat} without filling — the position is "
@@ -378,10 +501,10 @@ def _reconcile_closing_orders(scfg: dict) -> bool:
     """Poll every tracked working closing order and settle the ones that already
     resolved at the broker. Returns True when anything changed.
 
-    Run on load by BOTH the Trades and Close tabs. Without it a closing order
+    Run on load by BOTH the Trades and Positions tabs. Without it a closing order
     that expired overnight stayed "closing" in the store until the user happened
     to expand that specific row on the Trades tab (the per-trade Schwab reads are
-    deferred behind row expansion) — which left the Close tab refusing to place a
+    deferred behind row expansion) — which left the Positions tab refusing to place a
     new close, insisting an order was "already working", for an order that had
     been dead since the previous session's close.
 
@@ -443,7 +566,8 @@ def _submit_close(scfg: dict, trade: dict, limit: float, live: bool,
         if not trade.get("paper"):
             return {"ok": False,
                     "msg": ("Live position can't be closed in paper mode — set "
-                            "paper=false in config.toml and restart.")}
+                            "paper=false in config.toml (applies on your next "
+                            "click, no restart).")}
         _book_close(trade, close_qty, round(float(limit), 2), now)
         # Toast format: headline first, then ONE sentence per line (run_app
         # renders each following line as its own bullet).
@@ -513,10 +637,10 @@ def _cancel_close_order(scfg: dict, trade: dict) -> dict:
             "msg": "✅ Closing order canceled — the position is open again."}
 
 
-# ── Close Options section (live Schwab) — its own "Close" tab ─────────────────
+# ── Live Schwab option legs — the table behind the "Positions" tab ───────────
 
 # Cached (60s) read-only reader for every live option leg — it lives in
-# positions_cache so the Roll tab and the ⚙️ Settings dialog share one cache and
+# positions_cache so the roll builder and the ⚙️ Settings dialog share one cache and
 # one Schwab round-trip. Aliased here so existing `_option_positions(...)` calls
 # and `_option_positions.clear()` keep working (clearing the alias clears the
 # shared cache, which is what 🔄 should do).
@@ -610,35 +734,23 @@ def _submit_position_close(scfg: dict, pos: dict, limit: float,
 
 def _scroll_into_view() -> None:
     """Scroll the just-opened close builder into view after a position select.
-    Same technique as the Roll tab: Streamlit strips injected anchor ids, so the
-    component scrolls its own iframe (window.frameElement) into view."""
-    st.iframe(
-        """
-        <script>
-        (function() {
-          const el = window.frameElement;
-          if (!el) return;
-          window.parent.setTimeout(function() {
-            el.style.scrollMarginTop = "100px";
-            el.scrollIntoView({behavior: "smooth", block: "start"});
-          }, 150);
-        })();
-        </script>
-        """,
-        height=1, width=1,
-    )
+    Shared with the roll builder — see ui_theme."""
+    scroll_into_view()
 
 
 def _render_option_close(pos: dict, scfg: dict, market_open,
-                         config_paper: bool, spot: float | None = None) -> None:
-    """Close builder for one selected Schwab option leg: re-quote, editable
+                         config_paper: bool, spot: float | None = None,
+                         provider: str = "schwab") -> None:
+    """Close builder for one selected Schwab option leg: leg snapshot, editable
     limit + contracts (partial close), LIVE + market-hours gate, 2-step confirm.
     A tracked leg routes through _submit_close (so it shows 'closing' up top); an
     untracked leg uses _submit_position_close.
 
     `spot` is the underlying's live price, passed down from the caller's already-
-    fetched spot map (None when unavailable) so the quote line can lead with it
-    without a second fetch."""
+    fetched spot map (None when unavailable) so the snapshot can lead with it
+    without a second fetch. `provider` is only used to fetch the chain behind
+    IV+pp — this panel renders on row selection, not on tab load, so it can
+    afford the one scan a fitted surface needs."""
     tkr = str(pos.get("underlying", ""))
     opt = str(pos.get("option_type", "P"))
     strike = float(pos.get("strike", 0))
@@ -670,8 +782,9 @@ def _render_option_close(pos: dict, scfg: dict, market_open,
     # Live-only: these are real broker positions.
     if config_paper:
         st.warning("🔴 These are **live** broker positions. Closing needs "
-                   "`paper = false` in config.toml (then restart). In paper "
-                   "mode this section is view-only.")
+                   "`paper = false` in config.toml — it takes effect on your "
+                   "next click here, no restart needed. In paper mode this "
+                   "section is view-only.")
         return
 
     # Re-quote for a suggested limit (reuses the tracked-trade cache).
@@ -706,23 +819,18 @@ def _render_option_close(pos: dict, scfg: dict, market_open,
             f"Contracts (of {qty})", step=1,
             format="%d", key=_qk, disabled=(qty == 1))
     if q:
-        # Bold + full-strength (st.markdown, not the muted st.caption) so the
-        # live quote reads at a glance while setting the limit. Spot leads; the
-        # last print trails with its ET timestamp (regular weight — it's
-        # metadata) so a stale print is obvious. Unavailable segments are
-        # dropped rather than shown as a dash, keeping the line short.
-        _qp = []
-        if spot is not None and spot == spot and float(spot) > 0:  # not NaN
-            _qp.append(f"**Spot \\${float(spot):,.2f}**")
-        _qp += [f"**Bid \\${q.get('bid', 0):.2f}**",
-                f"**Ask \\${q.get('ask', 0):.2f}**",
-                f"**Mid \\${(q.get('mid') or 0):.2f}**"]
-        _last_px = float(q.get("last") or 0)
-        if _last_px > 0:
-            _lt = trade_actions.fmt_last_trade_et(q.get("last_trade_ms"))
-            _qp.append(f"**Last \\${_last_px:.2f}**"
-                       + (f" ({_lt})" if _lt else ""))
-        st.markdown("  ·  ".join(_qp))
+        # The same leg snapshot the roll and unwind builders show, from the same
+        # `leg_rows` — one contract described one way wherever you act on it.
+        # Everything here but IV+pp rides along on the re-quote above; IV+pp
+        # needs a chain fetch and surface fit (~2s, cached 5 min), which this
+        # panel pays because it only renders once a row is selected.
+        _iv_pp = leg_iv_pp(pos, tkr, provider, scfg)
+        st.markdown(kv_table_html(leg_rows(
+            q.get("bid"), q.get("ask"), q.get("mid"), q.get("last"),
+            q.get("open_interest"), q.get("volume"), q.get("last_trade_ms"),
+            iv_pp=_iv_pp, iv=q.get("iv"), delta=q.get("delta"),
+            spot=spot, fmt_last_et=trade_actions.fmt_last_trade_et),
+            pairs=2), unsafe_allow_html=True)
     else:
         st.caption("Re-quote unavailable — set your own limit.")
 
@@ -734,8 +842,14 @@ def _render_option_close(pos: dict, scfg: dict, market_open,
     _valid = _input_err is None
     if _valid:
         limit, close_n = float(limit), int(close_n)
+        # Buying back a short is a debit — what it costs, against what the
+        # account has to pay it with, right where the limit was just set.
+        if not is_long:
+            st.caption(f"Cost to close at this limit: "
+                       f"**{money_md(limit * 100 * close_n)}**")
     else:
         st.error(_input_err)
+    render_buying_power_caption(scfg, "Account", f"close_{posid}")
     _blocked = (None if market_open is True else
                 ("Equity options trade 9:30–16:00 ET, Mon–Fri."
                  if market_open is False else "Can't confirm market hours."))
@@ -818,6 +932,409 @@ def _render_option_close(pos: dict, scfg: dict, market_open,
         st.error(_result["msg"].replace("$", "\\$"))
 
 
+def _split_by_right(positions: list, frame, is_call: bool):
+    """``(positions, rows)`` for one side of the Positions tab's split tables.
+
+    The two must stay index-aligned. The table hands back a row *index*, and
+    that index picks the position to close — if the row frame and the position
+    list were filtered separately and drifted, selecting a row would close a
+    different leg than the one on screen. Both come out of a single mask here so
+    they can't.
+    """
+    import pandas as pd
+    mask = [(str(p.get("option_type", "P")).upper() == "C") == bool(is_call)
+            for p in positions]
+    subset = [p for p, keep in zip(positions, mask) if keep]
+    rows = frame[pd.Series(mask, index=frame.index)].reset_index(drop=True)
+    return subset, rows
+
+
+def _buying_power_line(cap: dict | None) -> str | None:
+    """"Cash $X · With margin $Y" for the Positions tab, or None when unavailable.
+
+    Closing a short is a debit, so the question this answers is "can I afford to
+    buy this back?". Two figures, both straight from Schwab and named for what
+    they are:
+
+    * **Cash** — settled cash you could spend without borrowing:
+      ``cashAvailableForTrading`` on a cash account, else ``cashBalance``.
+    * **With margin** — ``buyingPower`` (Schwab falls back to
+      ``optionBuyingPower``), i.e. cash plus what the account can borrow.
+
+    Only the cash figure shows on an account with no margin line, rather than
+    printing the same number twice under two labels.
+    """
+    if not cap:
+        return None
+    bal = cap.get("balances") or {}
+    cash = cap.get("cash")
+    if cash is None:
+        cash = bal.get("cashBalance")
+    margin = cap.get("bp")
+    if cash is None and margin is None:
+        return None
+    # money_md escapes each "$": two unescaped ones in a single markdown string
+    # are LaTeX delimiters, and Streamlit would eat both dollar signs and set
+    # everything between them in math type — which is what made these read as
+    # unformatted numbers rather than currency.
+    bits = []
+    if cash is not None:
+        bits.append(f"Cash **{money_md(cash)}**")
+    if margin is not None and (cash is None
+                               or abs(float(margin) - float(cash)) >= 1):
+        bits.append(f"with margin **{money_md(margin)}**")
+    return " · ".join(bits)
+
+
+# The caveat that matters before leaning on the margin figure, kept in one
+# place: every screen that shows these two numbers explains them the same way.
+_BUYING_POWER_TIP = (
+    "Cash is settled cash you can spend without borrowing (Schwab "
+    "cashAvailableForTrading, else cashBalance). With margin is Schwab "
+    "buyingPower — cash plus what the account can borrow. Long options are not "
+    "marginable, so your broker may allow less than the margin figure for an "
+    "option purchase.")
+
+# Both labels survive masking: which figures exist is not the private part, and
+# a bare "•••••" wouldn't say what had been hidden.
+_MASKED_BUYING_POWER = "Cash **\\$•••••** · with margin **\\$•••••**"
+
+
+def render_buying_power_caption(scfg: dict, lead: str, key: str = "") -> None:
+    """"💵 <lead>: Cash $X · with margin $Y" — or nothing when unavailable.
+
+    Reads the shared 60s account cache, so the Positions table and the roll
+    dialog cost one Schwab round-trip between them (the Sell dialog's sizing
+    read is the same one again). The whole line is the hover target — no marker,
+    just a help cursor carrying `_BUYING_POWER_TIP`.
+
+    Honors the ⚙️ mask-balances preference, with the 👁 reveal beside the line;
+    `key` keeps that button unique across the screens that render this (it's on
+    four). Masking is display-only — the figures themselves are still fetched,
+    because the caption is the only thing hiding them.
+    """
+    line = _buying_power_line(positions_cache.account_capacity(
+        scfg.get("app_key", ""), scfg.get("app_secret", ""),
+        scfg.get("callback_url", ""), scfg.get("token_file", "")))
+    if not line:
+        return
+    if settings_ui.balances_masked():
+        line = _MASKED_BUYING_POWER
+    _tc, _bc = st.columns([9, 1], vertical_alignment="center")
+    with _tc:
+        st.caption(f"<span style='cursor:help;' title='{_BUYING_POWER_TIP}'>"
+                   f"💵 {lead}: {line}</span>", unsafe_allow_html=True)
+    with _bc:
+        settings_ui.render_reveal_toggle(key or lead)
+
+
+# The stored lifecycle word for a live position is "open" — but on screen that
+# reads as an *open order*, i.e. one still working, which is the opposite of
+# what it means here. "held" can't be misread as an order state, and it works
+# for a paper position too (where "filled" would be a lie: nothing was sent to
+# a broker). Display only — `status` in the trade log is untouched, and nothing
+# branches on this string.
+_STATUS_WORDS = {"open": "held"}
+
+
+def _display_status(store_status, broker_status, filled_known: bool) -> str:
+    """The one status word for a trade — used by the collapsed header and the
+    expanded view alike, so they can't disagree.
+
+    Two different facts are in play: the store tracks the *record's* lifecycle
+    (open → closing → closed), the broker tracks the *opening order* (WORKING →
+    FILLED). The header used to substitute the broker's word for the store's
+    whenever a broker read happened to be available — and since a collapsed row
+    deliberately fetches nothing, the same trade read "open" collapsed and
+    "working" expanded.
+
+    The rule:
+
+    * a known fill means the position exists → **"held"** (a fill is recorded
+      once, as ``filled_at``, so this stays true without re-reading Schwab);
+    * an opening order that hasn't filled says what the broker says →
+      **"working"**, "rejected", "expired", …;
+    * with nothing known, the store's own word stands.
+
+    So the two states a reader has to tell apart — "my order is still out
+    there" and "I own this" — never share a word.
+    """
+    store_status = str(store_status or "open")
+    if store_status != "open" or filled_known or not broker_status:
+        return _STATUS_WORDS.get(store_status, store_status)
+    return str(broker_status).lower()
+
+
+def _intrinsic_value(spot, strike, option_type: str) -> float | None:
+    """Intrinsic value per share — what the contract is worth on exercise alone
+    (call: spot − strike, put: strike − spot, each floored at 0). None when spot
+    is unavailable."""
+    try:
+        spot, strike = float(spot), float(strike)
+    except (TypeError, ValueError):
+        return None
+    if spot != spot or spot <= 0:                   # NaN / no quote
+        return None
+    return (max(0.0, spot - strike) if str(option_type).upper() == "C"
+            else max(0.0, strike - spot))
+
+
+def yield_base(spot, strike, option_type: str, mark=None,
+               covered: bool = False) -> float | None:
+    """Capital a **held** leg actually ties up, per share — what an annualized
+    yield on it should be measured against. None when it can't be determined.
+
+    * **Covered call** → ``spot − mark``, the position's net liquidation value.
+      That's what unwinding frees, and it's the capital genuinely committed:
+      the upside is capped at the strike, so measuring against spot overstates
+      the base — on a deep-ITM call by about 2× (a $185 call with spot $380 ties
+      up ~$183/share, not $380).
+    * **Short put** → ``strike``, the cash securing it. Already a
+      capital-committed base, so unchanged.
+    * **Anything else** (long legs, naked short calls) → spot for calls, strike
+      for puts. A long's committed capital is the premium paid and a naked
+      call's is broker margin; neither is the same question, so the old rule
+      stands rather than inventing an answer.
+
+    Candidate options in a chain scan deliberately do NOT use this — nothing is
+    held yet, so the base there is the collateral you *would* commit
+    (`chain_common.build_row`).
+    """
+    try:
+        spot = float(spot) if spot is not None else None
+        strike = float(strike)
+    except (TypeError, ValueError):
+        return None
+    is_call = str(option_type).upper() == "C"
+    if covered and is_call:
+        try:
+            net_liq = spot - float(mark)
+        except (TypeError, ValueError):
+            net_liq = None
+        # A mark at or above spot would mean the call is worth more than the
+        # stock backing it — impossible for a standard option, so treat it as
+        # bad data and fall through rather than divide by ~0.
+        if net_liq is not None and net_liq > 0:
+            return net_liq
+    base = spot if is_call else strike
+    return base if base and base > 0 else None
+
+
+def _time_value(mark, spot, strike, option_type: str) -> float | None:
+    """Extrinsic value per share: ``mark − intrinsic``, floored at 0.
+
+    Whatever the market pays above intrinsic is time value. Floored because a
+    mark below intrinsic is a quote artifact — a wide spread or a stale print —
+    not negative time value.
+
+    None when the mark or spot is unavailable. Feeds both the Intrinsic | Time
+    column and the Ann% it's annualized into, so the two can't disagree.
+    """
+    intrinsic = _intrinsic_value(spot, strike, option_type)
+    if intrinsic is None:
+        return None
+    try:
+        mark = float(mark)
+    except (TypeError, ValueError):
+        return None
+    if mark != mark:
+        return None
+    return max(0.0, mark - intrinsic)
+
+
+def _position_pl(avg_price, mark, quantity, direction) -> float | None:
+    """Unrealized P/L on a whole option leg, in dollars.
+
+    Short: premium collected − cost to buy back → ``(avg − mark) × 100 × qty``.
+    Long:  value now − what you paid            → ``(mark − avg) × 100 × qty``.
+
+    Positive is in your favor either way, which is what lets one green/red rule
+    cover both directions. Replaces the raw Avg column: the broker's open price
+    only mattered as an input to this.
+    """
+    try:
+        avg, mk, qty = float(avg_price), float(mark), int(quantity)
+    except (TypeError, ValueError):
+        return None
+    if avg != avg or mk != mk or not qty:           # NaN / nothing held
+        return None
+    per_share = (avg - mk if str(direction).strip().lower() == "short"
+                 else mk - avg)
+    return per_share * 100 * qty
+
+
+# ── Moneyness: the ITM% column, the row shade, and the row order ────────────
+# Lives here rather than in rolls.py because tabs/rolls already imports from
+# this module (the reverse would be a cycle).
+#
+# Bands are (exclusive upper bound, tint, legend label), ordered deep-OTM →
+# deep-ITM; one table drives both the shade and the legend so they can't drift.
+# Translucent tints so they overlay the cell's theme background in light AND
+# dark mode, in a cool → hot ramp: slate (far out, nothing to do) → sky →
+# yellow at the money → orange → red. Deliberately no green — these tables
+# color P/L green, and a green row would read as "profitable" rather than "far
+# from the strike".
+MONEYNESS_BANDS = [
+    (-15.0, "rgba(148,163,184,0.16)", "&gt;15% OTM"),
+    (-5.0,  "rgba(56,189,248,0.16)",  "5–15% OTM"),
+    (5.0,   "rgba(234,179,8,0.18)",   "within 5% (ATM)"),
+    (15.0,  "rgba(249,115,22,0.18)",  "5–15% ITM"),
+    (None,  "rgba(239,68,68,0.18)",   "&gt;15% ITM"),
+]
+
+# ── Covered-call coverage: the stocks table's row shade and legend ──────────
+# Same rules as the moneyness bands above: translucent tints that overlay the
+# cell background in light AND dark mode, and no green — these tables color P/L
+# green, so a green row would read as "profitable" rather than "written".
+#
+# The ramp is by how much is left to do, quiet → loud: fully covered is slate
+# (nothing to act on, same reading slate has in MONEYNESS_BANDS), partial is
+# yellow, an uncovered position you could actually write is sky (the one row
+# that invites a click), and over-written is red because it's the only state
+# here that carries risk rather than opportunity.
+COVERAGE_BANDS = {
+    "covered":     ("rgba(148,163,184,0.16)", "Covered",
+                    "Written up to the last whole lot — nothing left to sell."),
+    "partial":     ("rgba(234,179,8,0.18)",   "Partly covered",
+                    "Some calls written, and another 100-share lot is free."),
+    "uncovered":   ("rgba(56,189,248,0.16)",  "Uncovered",
+                    "No calls written against these shares."),
+    "over_written": ("rgba(239,68,68,0.18)",  "Over-written",
+                     "More calls than shares to back them — part of the "
+                     "position is naked."),
+}
+
+# An uncovered odd lot (under 100 shares) gets no shade at all: it is genuinely
+# uncovered, but there is nothing you could write against it, so coloring it
+# like an actionable row would be noise. The label still reads "Uncovered".
+COVERAGE_NO_SHADE = ""
+
+
+def coverage_color(state: str, coverable: int = 0) -> str:
+    """Row tint for a coverage state; "" when there's nothing worth shading."""
+    if state == "uncovered" and not coverable:
+        return COVERAGE_NO_SHADE
+    band = COVERAGE_BANDS.get(str(state))
+    return band[0] if band else ""
+
+
+def coverage_bg(state: str, coverable: int = 0) -> str:
+    """`coverage_color` as a pandas Styler declaration ("" for no shade)."""
+    color = coverage_color(state, coverable)
+    return f"background-color: {color}" if color else ""
+
+
+def coverage_label(state: str) -> str:
+    band = COVERAGE_BANDS.get(str(state))
+    return band[1] if band else str(state)
+
+
+MONEYNESS_HELP = (
+    "How far the strike is through the money, as a % of spot: positive = in "
+    "the money, negative = out of the money. Same figure the row shade uses. "
+    "Rows start furthest out of the money; click to re-sort. Blank when spot "
+    "is unavailable.")
+
+
+def signed_moneyness(spot, strike, option_type) -> float | None:
+    """Moneyness as a signed % of spot: + = in the money, − = out of it.
+
+    A property of the contract, not of your side of it — the sign flips between
+    calls and puts, not between long and short. None when spot is unknown, which
+    the callers keep distinct from 0.0 (exactly at the money).
+    """
+    try:
+        sp, k = float(spot), float(strike)
+    except (TypeError, ValueError):
+        return None
+    if sp != sp or sp <= 0 or k != k:   # NaN / no usable spot
+        return None
+    diff = (sp - k) if str(option_type).upper() == "C" else (k - sp)
+    return diff / sp * 100.0
+
+
+def moneyness_color(itm) -> str:
+    """Tint for a signed moneyness (% of spot, + = ITM); "" if unknown.
+
+    An exact edge shades as the OTM-ward band (5.0 is ATM, −5.0 is 5–15% OTM),
+    matching how these bands read before the five-bucket split.
+    """
+    try:
+        f = float(itm)
+    except (TypeError, ValueError):
+        return ""
+    if f != f:  # NaN → no shade
+        return ""
+    for upper, color, _label in MONEYNESS_BANDS:
+        if upper is None or f <= upper:
+            return color
+    return ""
+
+
+def moneyness_bg(itm) -> str:
+    """`moneyness_color` as a pandas Styler declaration ("" for no shade)."""
+    color = moneyness_color(itm)
+    return f"background-color: {color}" if color else ""
+
+
+def sort_by_moneyness(positions: list, table):
+    """(positions, table) reordered furthest-OTM first, kept in lockstep.
+
+    Moneyness is only known once the table has fetched spot, so the built frame
+    is what gets sorted — and `positions` is permuted the same way, because row
+    selection maps the clicked row index back into that list. If the two ever
+    drift, clicking a row acts on a DIFFERENT leg than the one displayed: they
+    are reordered together here, and nowhere else.
+
+    A stable sort leaves the caller's ticker/strike ordering as the tie-break.
+    Legs with no spot (blank ITM%) sort last rather than reading as 0%, which
+    would float them into the middle as if they were at the money.
+    """
+    import pandas as pd   # local, like every other pandas use in this module
+    rank = pd.to_numeric(table["ITM%"], errors="coerce")
+    order = list(rank.sort_values(ascending=True, na_position="last",
+                                  kind="stable").index)
+    return ([positions[i] for i in order],
+            table.loc[order].reset_index(drop=True))
+
+
+def moneyness_legend() -> None:
+    """The row-shade color key, rendered off the same bands that shade rows."""
+    swatches = "".join(
+        "<span style='display:inline-flex;align-items:center;margin-right:18px;'>"
+        "<span style='display:inline-block;width:15px;height:15px;"
+        "border-radius:3px;border:1px solid rgba(128,128,128,0.5);"
+        f"background:{_c};margin-right:6px;'></span>{_lbl}</span>"
+        for _upper, _c, _lbl in MONEYNESS_BANDS)
+    st.markdown(
+        "<div style='font-size:0.8rem;color:var(--osc-ink-3);margin:2px 0 8px 0;'>"
+        "<span style='font-weight:600;color:var(--osc-ink-2);margin-right:12px;'>"
+        f"Row shade — moneyness:</span>{swatches}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _signed_value(market_value, quantity: int, direction) -> float | None:
+    """The whole leg's market value, signed like a brokerage statement: an
+    option you sold is negative (a liability — what it costs to buy back), one
+    you bought is positive. None when nothing is held or the value is unusable.
+
+    The sign comes from `direction`, NOT from the broker's own sign, so it can't
+    flip on us if Schwab ever reports a short's marketValue unsigned — only the
+    magnitude is taken from the broker. An unknown direction reads as long: an
+    asset can't understate what you owe.
+    """
+    try:
+        mv, qty = float(market_value), int(quantity)
+    except (TypeError, ValueError):
+        return None
+    if mv != mv or not qty:          # NaN / nothing held
+        return None
+    magnitude = abs(mv)
+    return (-magnitude if str(direction).strip().lower() == "short"
+            else magnitude)
+
+
 def _pos_pkey(p: dict) -> tuple:
     """Stable identity for an option leg — keys the prefetched-quote map."""
     return (p.get("underlying", ""), p.get("option_type", "P"),
@@ -828,7 +1345,7 @@ def _prefetch_position_quotes(positions: list, scfg: dict) -> dict:
     """Parallel per-leg re-quotes → {pkey: quote|None}, so the positions table
     shows each leg's live delta without N sequential round-trips. Reuses the
     cached `_close_quote`; a slow/hung leg leaves that entry None (delta blank)
-    rather than blocking the tab. Mirrors the Roll tab's _prefetch_quotes — can't
+    rather than blocking the tab. Mirrors the roll builder's quote prefetch — can't
     import it (rolls imports from this module → circular)."""
     if not positions:
         return {}
@@ -873,16 +1390,23 @@ def _sign_color(v) -> str:
 
 
 @st.fragment
-def _render_option_positions(scfg: dict, provider: str, market_open) -> None:
-    """The 'Close Options (Schwab)' section (the "Close" tab): list every live
-    option leg (with live delta, remaining-time-value Ann%, and the underlying's
-    spot / day change) and let the user close all or part of one."""
+def _render_option_positions(scfg: dict, provider: str, market_open,
+                             render_detail=None) -> None:
+    """The Positions tab's table: every live option leg (with live delta,
+    remaining-time-value Ann%, moneyness, and the underlying's spot / day
+    change), and a detail panel for the selected row.
+
+    `render_detail(pos, scfg, provider, market_open, config_paper, spot)` renders
+    that panel; it defaults to the close builder, and the Positions tab passes
+    one that offers Close *or* Roll. The argument exists because the roll flow
+    lives in `tabs/rolls`, which imports this module — the callback keeps the
+    dependency pointing one way."""
     import pandas as pd
     from options_scanner.display.spot_meta import fetch_spot_meta
 
     _hdr, _rf = st.columns([8, 1], vertical_alignment="bottom")
     with _hdr:
-        section_header(title="Close Options (Schwab)")
+        section_header(title="Your Option Positions (Schwab)")
     with _rf:
         if st.button("🔄", key="opt_pos_refresh",
                      help="Re-fetch positions, quotes, order status, and spot."):
@@ -890,6 +1414,11 @@ def _render_option_positions(scfg: dict, provider: str, market_open) -> None:
             _close_quote.clear()
             _order_status.clear()
             fetch_spot_meta.clear()
+            # Full rerun, not the implicit fragment one — the top-bar Schwab
+            # token countdown and run_app's token-mtime cache invalidation are
+            # script-level, so 🔄 after a re-auth must re-run the whole app or
+            # the toggle keeps reading "Schwab (expired)".
+            st.rerun()
 
     if provider != "schwab" or not scfg.get("app_key"):
         st.info("Connect Schwab and select it as the data source (top bar) to "
@@ -915,12 +1444,12 @@ def _render_option_positions(scfg: dict, provider: str, market_open) -> None:
     # the cached reader: the cache keeps the account's truth, and a settings
     # change lands on the next rerun instead of waiting out the 60s TTL.
     _held_n = len(positions)
-    positions, _hidden = settings_ui.filter_hidden(positions, scope="close")
+    positions, _hidden = settings_ui.filter_hidden(positions, scope="positions")
     if not positions:
         st.caption(f"All {_held_n} of your option positions are hidden by your "
                    f"⚙️ Settings — nothing to show.")
         # Still render the notice: it carries the toggle that reveals them.
-        settings_ui.render_hidden_notice(_hidden, scope="close")
+        settings_ui.render_hidden_notice(_hidden, scope="positions")
         return
 
     config_paper = bool(scfg.get("paper", True))
@@ -967,20 +1496,32 @@ def _render_option_positions(scfg: dict, provider: str, market_open) -> None:
         _spot_v = (meta.get(_tkr) or {}).get("spot")
         _spot = (float(_spot_v) if (_spot_v is not None and _spot_v == _spot_v
                                     and float(_spot_v) > 0) else None)
-        # Annualized % of the remaining time value (extrinsic): time value =
-        # mark − intrinsic; annualized against strike (puts) or spot (calls),
-        # matching the scanner's Ann% convention.
+        # Intrinsic + time value per share, and the time value annualized over
+        # the capital the position ties up (see yield_base — net liquidation for
+        # a covered call, the cash collateral for a put). Time value is computed
+        # independently of DTE so a position expiring today still shows what's
+        # left; only Ann% needs days to annualize over.
+        _intr = _intrinsic_value(_spot, _strike, _opt)
+        _tv = _time_value(_mark, _spot, _strike, _opt)
         _ann = None
-        if _mark is not None and _spot is not None and _dte_v and _dte_v > 0:
-            _intrinsic = (max(0.0, _spot - _strike) if _opt == "C"
-                          else max(0.0, _strike - _spot))
-            _tv = max(0.0, _mark - _intrinsic)
-            _base = _spot if _opt == "C" else _strike
-            if _base > 0:
+        if _tv is not None and _dte_v and _dte_v > 0:
+            _base = yield_base(_spot, _strike, _opt, _mark,
+                               covered=trade_actions.is_unwindable(p))
+            if _base:
                 _ann = _tv / _base * (365.0 / _dte_v) * 100.0
         _delta = (quotes.get(_pos_pkey(p)) or {}).get("delta")
-        _tracked = _tracked_open_leg(_tkr, _opt, _strike,
-                                     p.get("expiration", "")) is not None
+        # One trade-log lookup, two uses: the "tracked" tag, and how long the
+        # leg has been open (the broker reports neither). A position opened
+        # outside the scanner has no record and simply shows its DTE alone.
+        _trec = _tracked_open_leg(_tkr, _opt, _strike, p.get("expiration", ""))
+        _tracked = _trec is not None
+        _days_open = days_since(_trec.get("opened_at")) if _trec else None
+        # Open cell: what the UNDERLYING cost when the position was opened, then
+        # what the option itself opened at. The stock figure is only ever
+        # recorded by this app (fill_spot at the fill), so "—" holds its slot for
+        # a leg opened elsewhere and the option's price stays on the right.
+        _open_cell = open_prices_cell((_trec or {}).get("fill_spot"),
+                                      p.get("avg_price"))
         _tags = ([("covered" if p.get("covered") else "naked")]
                  if _opt == "C" and _dir == "short" else [])
         if _tracked:
@@ -988,72 +1529,163 @@ def _render_option_positions(scfg: dict, provider: str, market_open) -> None:
         _spotday, _pct = _spot_day(_tkr)
         rows.append({
             "Ticker": _tkr,
+            # Second column: what the row sorts by and what the shade says, so
+            # it reads with the ticker. Raw float — the column sorts by depth.
+            "ITM%": signed_moneyness(_spot, _strike, _opt),
             "Spot/Day%": _spotday,
             "_pct": _pct,
-            "Type": f"{'Call' if _opt == 'C' else 'Put'} - "
-                    f"{'Short' if _dir == 'short' else 'Long'}",
+            "_opt": _opt,   # hidden — splits the rows into the two tables
+            # Just the direction: puts and calls have their own tables, so the
+            # right is in the table heading rather than repeated on every row.
+            "Type": "Short" if _dir == "short" else "Long",
             "Strike": _strike,
             "Exp": p.get("expiration", ""),
-            "DTE": _dte_v,
+            "DTE": dte_cell(_dte_v, _days_open),
             "Qty": _qty,
             "Delta": (round(_delta, 2) if _delta is not None else None),
             "Ann%": (round(_ann, 1) if _ann is not None else None),
-            "Avg": round(float(p.get("avg_price", 0)), 2),
-            "Mkt Val": round(_mv, 0),
+            # What the leg's value is made of, split whole-leg the same way Mkt
+            # Val beside it is: exercise value vs what's left to decay. Text,
+            # since it carries two figures.
+            "Intrinsic | Time": (
+                f"${_intr * 100 * _qty:,.0f} | ${_tv * 100 * _qty:,.0f}"
+                if (_intr is not None and _tv is not None) else "—"),
+            # Left of Mkt Val so the row reads open → worth now → P/L.
+            "Open$": _open_cell,
+            "Mkt Val": _signed_value(_mv, _qty, _dir),
+            "P/L": _position_pl(p.get("avg_price"), _mark, _qty, _dir),
             "Note": " · ".join(_tags),
         })
     disp = pd.DataFrame(rows)
-    st.caption("🔍 **Select a position** to close all or part of it. To roll an "
-               "existing position instead, use the **Roll** tab.")
+    # What you have to close with. Buying back a short is a debit, so this is
+    # the number that decides whether a close is affordable — shared 60s cache
+    # with the Sell dialog, so it costs no extra round-trip.
+    render_buying_power_caption(scfg, "Available to close", "table")
+    st.caption("🔍 **Select a position** to close it (all or part) or roll it.")
     st.caption("view-only in paper mode." if config_paper
                else "**🔴 LIVE** (buy-to-close for short legs, sell-to-close "
                     "for long).")
-    styled = disp.style.apply(
-        lambda s: [_sign_color(disp.loc[i, "_pct"]) for i in s.index],
-        subset=["Spot/Day%"])
-    event = st.dataframe(
-        styled, hide_index=True, width="stretch", on_select="rerun",
-        selection_mode="single-row", key="opt_pos_table",
-        height=df_height(styled),
-        column_config={
+    _col_cfg = {
+            # Uncolored on purpose: the row shade already carries how far
+            # through the money the leg is, and green/red text would fight it —
+            # deeper ITM is bad for a short and good for a long, so no single
+            # color rule fits a table holding both.
+            "ITM%": st.column_config.NumberColumn(
+                "ITM%", format="%+.1f%%", width=85, help=MONEYNESS_HELP),
             "Spot/Day%": st.column_config.TextColumn(
                 "Spot/Day%", width=130,
                 help="Underlying spot and today's change (green up / red down)."),
             "_pct": None,
+            "_opt": None,
+            "Type": st.column_config.TextColumn(
+                "Direction", width=85,
+                help="Short = you sold it (closing buys it back). Long = you "
+                     "bought it (closing sells it)."),
             "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
             "Delta": st.column_config.NumberColumn("Delta", format="%.2f"),
             "Ann%": st.column_config.NumberColumn(
                 "Ann%", format="%.1f%%",
                 help="Annualized return on the option's remaining time value "
-                     "(extrinsic) — puts vs strike, calls vs spot. Low = little "
-                     "premium left to decay, a cue to close."),
-            "Avg": st.column_config.NumberColumn("Avg", format="$%.2f"),
-            "Mkt Val": st.column_config.NumberColumn("Mkt Val", format="$%.0f"),
-            "DTE": st.column_config.NumberColumn("DTE", format="%d"),
-        })
-    sel = event.selection.rows if hasattr(event, "selection") else []
-    if sel:
-        if st.session_state.get("_opt_pos_scroll") != sel[0]:
-            st.session_state["_opt_pos_scroll"] = sel[0]
+                     "(extrinsic), over the capital the position ties up: a "
+                     "covered call against its net liquidation value (spot "
+                     "minus the call — what unwinding would free), a put "
+                     "against the cash securing it (strike). Low = little "
+                     "premium left to decay, a cue to close or unwind."),
+            "Intrinsic | Time": st.column_config.TextColumn(
+                "Intrinsic | Time", width=140,
+                help="What the leg's value is made of, whole-leg (× 100 × "
+                     "contracts): intrinsic = worth on exercise alone; time = "
+                     "the extrinsic left. A deep ITM leg is nearly all "
+                     "intrinsic — nothing left to decay, so holding it only "
+                     "carries assignment risk."),
+            # Label spells out both slots — two dollar figures in one cell are
+            # otherwise ambiguous. Key stays "Open$" to match the frame column.
+            "Open$": st.column_config.TextColumn(
+                "Open (stock · option)", width=160,
+                help="What the underlying was trading at when the position was "
+                     "opened, then the option's own opening price per share. "
+                     "The stock figure is recorded when a trade is placed here, "
+                     "so it reads '—' for legs opened outside the scanner; the "
+                     "option figure is the broker's average price."),
+            "Mkt Val": st.column_config.NumberColumn(
+                "Mkt Val", format="$%.0f",
+                help="Current market value of the whole leg, as the broker "
+                     "carries it: negative for a short (a liability — what it "
+                     "costs to buy back), positive for a long."),
+            "P/L": st.column_config.NumberColumn(
+                "P/L", format="$%+,.0f",
+                help="Unrealized P/L on the leg, against the broker's average "
+                     "open price. Short: premium collected − cost to buy back. "
+                     "Long: value now − what you paid. Positive is in your "
+                     "favor either way."),
+            # Text, not a number: it carries the days-open parenthetical. The
+            # label spells that out so the second figure doesn't read as a
+            # second DTE.
+            "DTE": st.column_config.TextColumn(
+                "DTE (days open)", width=140,
+                help="Days to expiration, and — in parentheses — how many days "
+                     "ago the position was opened. The open date comes from the "
+                     "app's trade log, so the parens appear only for legs "
+                     "opened through the scanner; anything opened elsewhere "
+                     "shows the DTE alone."),
+    }
+
+    # Puts and calls in their own tables, puts first — they're different trades
+    # (a short put is cash-secured, a short call is covered by shares), and
+    # splitting them keeps the sort within each kind. Each table maps its own
+    # row index back to its own slice of `positions`, so a selection can't point
+    # at the wrong leg.
+    for _label, _is_call, _key in (("Puts", False, "opt_pos_put"),
+                                   ("Calls", True, "opt_pos_call")):
+        _subset, _sub = _split_by_right(positions, disp, _is_call)
+        if not _subset:
+            continue
+        st.markdown(f"**{_label}** ({len(_subset)})")
+        # Furthest out of the money first, rows shaded by band — same reading as
+        # the roll builder expects. Both halves of the split are reordered together
+        # so a click still selects the leg on that row.
+        _subset, _sub = sort_by_moneyness(_subset, _sub)
+        _styled = (_sub.style
+                   .apply(lambda r: [moneyness_bg(_sub.loc[r.name, "ITM%"])]
+                          * len(r), axis=1)
+                   .apply(lambda s: [_sign_color(_sub.loc[i, "_pct"])
+                                     for i in s.index], subset=["Spot/Day%"])
+                   .map(_sign_color, subset=["P/L"]))
+        event = st.dataframe(
+            _styled, hide_index=True, width="stretch", on_select="rerun",
+            selection_mode="single-row", key=_key,
+            height=df_height(_styled), column_config=_col_cfg)
+        sel = event.selection.rows if hasattr(event, "selection") else []
+        _scroll_guard = f"_opt_pos_scroll_{_key}"
+        if not sel:
+            st.session_state.pop(_scroll_guard, None)
+            continue
+        if st.session_state.get(_scroll_guard) != sel[0]:
+            st.session_state[_scroll_guard] = sel[0]
             _scroll_into_view()
         st.markdown("---")
         # Reuse the spot already fetched for the table above (same cached
         # source), so the close panel's quote line can't disagree with the row.
-        _sel_pos = positions[sel[0]]
+        _sel_pos = _subset[sel[0]]
         _sel_spot = (meta.get(str(_sel_pos.get("underlying", ""))) or {}).get(
             "spot")
-        _render_option_close(_sel_pos, scfg, market_open, config_paper,
-                             _sel_spot)
+        if render_detail is None:
+            _render_option_close(_sel_pos, scfg, market_open, config_paper,
+                                 _sel_spot, provider)
+        else:
+            render_detail(_sel_pos, scfg, provider, market_open, config_paper,
+                          _sel_spot)
         st.markdown("---")
-    else:
-        st.session_state.pop("_opt_pos_scroll", None)
+
+    # Color key for the moneyness row shading (below both tables).
+    moneyness_legend()
 
     # Hidden-position note last, so it never pushes the table down.
-    settings_ui.render_hidden_notice(_hidden, scope="close")
+    settings_ui.render_hidden_notice(_hidden, scope="positions")
 
 
 def _trades_context() -> tuple:
-    """Per-render context shared by the Trades and Close tabs:
+    """Per-render context shared by the Trades and Positions tabs:
     (provider, scfg, market_open). market_open (None = unknown → fail safe) gates
     live closing; it's one cached (60s) Schwab read."""
     provider = st.session_state.get("data_source", "yahoo")
@@ -1067,24 +1699,17 @@ def _trades_context() -> tuple:
 
 
 def tab_trades() -> None:
-    # The "Trades" tab: the scanner-trades list only. Managing live Schwab option
-    # positions moved to its own "Close" tab (tab_close). _scanner_trades is a
-    # fragment, so a trade-row toggle or the 🔄 reruns just this list, not the app.
+    # The "Trades" tab: the scanner-trades list only. Live Schwab option legs
+    # live on the "Positions" tab (tabs/rolls.tab_positions, which renders
+    # _render_option_positions below). _scanner_trades is a fragment, so a
+    # trade-row toggle or the 🔄 reruns just this list, not the app.
     provider, scfg, market_open = _trades_context()
     _scanner_trades(provider, scfg, market_open)
 
 
-def tab_close() -> None:
-    # The "Close" tab: the Close Options (Schwab) section — list live option legs
-    # and close all or part of one. _render_option_positions is a fragment, so
-    # its 🔄 and row-select rerun just this section.
-    provider, scfg, market_open = _trades_context()
-    _render_option_positions(scfg, provider, market_open)
-
-
 @st.fragment
 def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
-    # A fragment so trade-row toggles and the 🔄 rerun just this list. The toggle
+    # A fragment so trade-row toggles rerun just this list. The toggle
     # uses st.rerun(scope="fragment") (legal — we're always inside this fragment);
     # explicit Cancel / Remove / close actions keep a full st.rerun(), and run_app
     # preserves the active tab across it.
@@ -1105,9 +1730,22 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
     # expansion, so without this it stayed "closing" until the user drilled in.
     _reconcile_closing_orders(scfg)
 
-    # "rolling" trades are in-flight net-price rolls managed on the Roll tab —
-    # they surface here as normal open positions only once they fill.
-    trades = [t for t in trades_store.load() if t.get("status") != "rolling"]
+    # Is the broker actually reachable this render? Everything below that reads
+    # or writes at Schwab is gated on this, and an expanded row says so rather
+    # than silently showing dashes.
+    _schwab_live = provider == "schwab" and bool(scfg.get("app_key"))
+
+    # Settle any working roll before the list is read. Imported late: rolls.py
+    # imports from this module, so a top-level import would be circular.
+    if _schwab_live:
+        from options_scanner.tabs.rolls import reconcile_rolls
+        for _note in reconcile_rolls(scfg):
+            st.info(_note)
+
+    # In-flight rolls (status "rolling") are listed here too, so a placed roll
+    # can be watched through to its fill in the same place as everything else —
+    # they used to be filtered out and visible only on the old Roll tab.
+    trades = trades_store.load()
     if not trades:
         section_header(title=f"Trades made from Scanner{_mode_badge}")
         st.info(
@@ -1118,9 +1756,8 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
         return
 
     # Title (with a small, muted trade count) + a compact 🔄 refresh on one
-    # row. Refresh clears the cached status/quote/spot fetches so this rerun
-    # (the button click reruns the fragment) re-pulls them — e.g. to catch a
-    # fill — instead of taking its own row.
+    # row. Refresh clears the cached status/quote/spot fetches so the rerun
+    # re-pulls them — e.g. to catch a fill — instead of taking its own row.
     _open_n = sum(1 for t in trades if t.get("status") == "open")
     _count = (f" <span style='font-size:0.5em;color:#94a3b8;font-weight:500;"
               f"vertical-align:middle;'>{len(trades)} trade(s) · {_open_n} "
@@ -1135,6 +1772,9 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
             _close_quote.clear()
             from options_scanner.display.spot_meta import fetch_spot_meta
             fetch_spot_meta.clear()
+            # Full rerun — see the Positions 🔄 above: the top-bar token
+            # countdown only recomputes at script level.
+            st.rerun()
 
     # Notes from the reconciliation above (e.g. "closing order EXPIRED without
     # filling"), shown once at the top — the record may have been removed, so a
@@ -1212,6 +1852,8 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
     quote_by_id: dict = {}
     chart_by_ticker: dict = {}   # ticker -> intraday series for the day chart
     spot_by_ticker: dict = {}    # ticker -> {spot, pct_change} for the headers
+    roll_close_quote_by_id: dict = {}   # in-flight roll: the leg being closed
+    roll_status_by_id: dict = {}        # in-flight roll: its net order status
     if provider == "schwab" and scfg.get("app_key"):
         _ak, _as = scfg.get("app_key", ""), scfg.get("app_secret", "")
         _cb, _tf = scfg.get("callback_url", ""), scfg.get("token_file", "")
@@ -1229,6 +1871,19 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                                 tr.get("expiration", ""),
                                 float(tr.get("strike", 0)),
                                 tr.get("option_type", "P"))
+
+        def _roll_close_quote_job(tr):
+            # The leg a roll is buying back — the record itself describes the
+            # NEW leg, so this one comes out of roll_from.
+            rf = tr.get("roll_from") or {}
+            return _close_quote(_ak, _as, _cb, _tf, tr.get("ticker"),
+                                rf.get("expiration", ""),
+                                float(rf.get("strike", 0) or 0),
+                                rf.get("option_type", tr.get("option_type", "P")))
+
+        def _roll_status_job(tr):
+            return _order_status(_ak, _as, _cb, _tf, tr.get("roll_order_id"),
+                                 (tr.get("account") or "")[-4:])
 
         def _chart_job(tr):
             return _intraday(_ak, _as, _cb, _tf, tr.get("ticker"))
@@ -1253,23 +1908,36 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
             # noise; it isn't fetched and the header omits the segment.
             _stk = tr.get("ticker")
             if (_stk and _stk not in _spot_seen
-                    and tr.get("status") in ("open", "closing")):
+                    and tr.get("status") in ("open", "closing", "rolling")):
                 _spot_seen.add(_stk)
                 jobs.append(("spot", _stk, tr))
-            # Deferred load: a collapsed trade fetches nothing else. Its Schwab
-            # reads run only once the user opens its row (the toggle header below
-            # sets this flag, then reruns so this loop picks the trade up). Tab
-            # load starts with every row collapsed → no per-trade round-trips.
-            if not st.session_state.get(f"trade_open_{tr.get('id')}", False):
-                continue
-            # Opening-order status only matters while the trade is still open;
-            # a working closing order is polled via close_order_id instead.
+            _expanded = st.session_state.get(f"trade_open_{tr.get('id')}", False)
+            # Opening-order status. Polled even while COLLAPSED when the order is
+            # unresolved — otherwise the header calls a still-working order
+            # "open", which is what it says once a fill is confirmed. A fill is
+            # recorded on the trade (filled_at, below) the first time we see it,
+            # so a filled position never needs this read again: only genuinely
+            # in-flight orders keep costing a round-trip. Expanded rows still
+            # read it either way, since the broker line there shows fill details.
             if (not tr.get("paper") and tr.get("order_id")
-                    and tr.get("status") == "open"):
+                    and tr.get("status") == "open"
+                    and (not tr.get("filled_at") or _expanded)):
                 jobs.append(("status", tr.get("id"), tr))
+            # Deferred load: a collapsed trade fetches nothing else. Its
+            # remaining Schwab reads run only once the user opens its row (the
+            # toggle header below sets this flag, then reruns so this loop picks
+            # the trade up).
+            if not _expanded:
+                continue
+            # A working closing order is polled via close_order_id instead.
             if (not tr.get("paper") and tr.get("close_order_id")
                     and tr.get("status") == "closing"):
                 jobs.append(("close_status", tr.get("id"), tr))
+            # An in-flight roll needs BOTH legs quoted (the net it would fill at
+            # is the difference) plus its own order status.
+            if tr.get("status") == "rolling":
+                jobs.append(("roll_close_quote", tr.get("id"), tr))
+                jobs.append(("roll_status", tr.get("id"), tr))
             jobs.append(("quote", tr.get("id"), tr))
             # One intraday fetch per unique ticker (keyed by ticker, deduped).
             _ctk = tr.get("ticker")
@@ -1289,12 +1957,16 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                         "close_status": _close_status_job,
                         "quote": _quote_job,
                         "chart": _chart_job,
-                        "spot": _spot_job}
+                        "spot": _spot_job,
+                        "roll_close_quote": _roll_close_quote_job,
+                        "roll_status": _roll_status_job}
             _job_maps = {"status": status_by_id,
                          "close_status": close_status_by_id,
                          "quote": quote_by_id,
                          "chart": chart_by_ticker,
-                         "spot": spot_by_ticker}
+                         "spot": spot_by_ticker,
+                         "roll_close_quote": roll_close_quote_by_id,
+                         "roll_status": roll_status_by_id}
             fut_map = {}
             for kind, tid, tr in jobs:
                 fut_map[ex.submit(_job_fns[kind], tr)] = (kind, tid)
@@ -1333,8 +2005,22 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
         is_paper = bool(t.get("paper"))
         _store_status = t.get("status", "open")
         _pending_open = _store_status == "open" and working
-        _disp_status = ((bs.get("status") or _store_status).lower()
-                        if _store_status == "open" and bs else _store_status)
+        # Record the fill the first time we see it. That makes "did this order
+        # fill?" a durable fact on the trade instead of an answer that needs a
+        # Schwab read every time the tab loads — which is what lets the prefetch
+        # above stop polling resolved orders, and what lets a collapsed row say
+        # "open" and mean it.
+        if filled and not t.get("filled_at"):
+            _fat = bs.get("filled_at")
+            _fat_iso = (_fat.isoformat(timespec="seconds")
+                        if hasattr(_fat, "isoformat")
+                        else (str(_fat) if _fat else
+                              datetime.now().isoformat(timespec="seconds")))
+            trades_store.update(t["id"], filled_at=_fat_iso)
+            t["filled_at"] = _fat_iso
+        _disp_status = _display_status(
+            _store_status, bs.get("status") if bs else None,
+            filled or bool(t.get("filled_at")))
         _otw = "CALL" if t.get("option_type") == "C" else "PUT"
         # Underlying spot + today's change, just before the mode badge — which
         # stays the last element on every line. Absent for a closed record (no
@@ -1345,10 +2031,21 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
         # The strike's "$" is escaped: two unescaped dollar signs in one markdown
         # string (strike + spot) get parsed as LaTeX math, which swallows them
         # and reflows the middle of the header into a serif math run.
-        label = (f"{t.get('ticker', '?')} \\${t.get('strike', '?')} {_otw} — "
-                 f"{exp_disp} · {qty}x · {_disp_status}"
-                 + (f" · {_spot_seg}" if _spot_seg else "")
-                 + ("  ·  📝 PAPER" if t.get("paper") else "  ·  🔴 LIVE"))
+        if _store_status == "rolling":
+            # A roll is two legs, so the header names both — "$150 → $160" reads
+            # as the move, where a single strike would look like a plain
+            # position and hide what's actually in flight.
+            _rf = t.get("roll_from") or {}
+            label = (f"{t.get('ticker', '?')} {_otw} "
+                     f"\\${_rf.get('strike', '?')} → \\${t.get('strike', '?')} "
+                     f"— {exp_disp} · {qty}x · rolling"
+                     + (f" · {_spot_seg}" if _spot_seg else "")
+                     + ("  ·  📝 PAPER" if t.get("paper") else "  ·  🔴 LIVE"))
+        else:
+            label = (f"{t.get('ticker', '?')} \\${t.get('strike', '?')} {_otw} — "
+                     f"{exp_disp} · {qty}x · {_disp_status}"
+                     + (f" · {_spot_seg}" if _spot_seg else "")
+                     + ("  ·  📝 PAPER" if t.get("paper") else "  ·  🔴 LIVE"))
 
         # Lazy row (replaces st.expander): a collapsed trade renders only this
         # header and fetches nothing — its Schwab reads were skipped in the
@@ -1387,7 +2084,64 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                     "This deleted the app's record only — any broker position is "
                     "untouched.")
                 st.rerun()
+        # An in-flight roll is its own thing: two legs moving as one net order,
+        # with no position to show P/L on until it fills. Render the shared
+        # monitor (both legs' quotes, net now vs your limit, broker status) and
+        # skip the single-leg position body entirely.
+        if _store_status == "rolling":
+            if is_open:
+                from options_scanner.tabs.rolls import (render_roll_monitor,
+                                                        _cancel_roll)
+                render_roll_monitor(t, roll_close_quote_by_id.get(t.get("id")),
+                                    quote_by_id.get(t.get("id")),
+                                    roll_status_by_id.get(t.get("id")))
+                _rbs = roll_status_by_id.get(t.get("id"))
+                _rk = f"roll_cancel_result_{t['id']}"
+                _rc1, _rc2, _ = st.columns([2, 2, 3])
+                with _rc1:
+                    _cancelable = bool(_rbs and _rbs.get("cancelable"))
+                    if st.button(
+                            "Cancel roll", key=f"trades_cancel_roll_{t['id']}",
+                            disabled=not _cancelable, width="stretch",
+                            help=("Cancels the unfilled net order; your current "
+                                  "position stays as it is." if _cancelable else
+                                  "Only a working order can be canceled — hit "
+                                  "🔄 to re-check.")):
+                        st.session_state[_rk] = _cancel_roll(scfg, t)
+                        _order_status.clear()
+                        st.rerun()
+                with _rc2:
+                    _rmbox = st.container(key=f"rm_box_{t['id']}")
+                    _rmbox.button("Remove from Tracker", key=f"rm_{t['id']}",
+                                  on_click=trades_store.remove,
+                                  args=(t["id"],), width="stretch")
+                _rres = st.session_state.get(_rk)
+                if _rres:
+                    (st.success if _rres["ok"] else st.error)(
+                        _rres["msg"].replace("$", "\\$"))
+            continue
+
         if is_open:
+            # Not on Schwab → say so up front. Everything broker-side is
+            # unavailable (re-quote, P/L, order status, closing), so without
+            # this the row is a wall of dashes with no stated reason — and the
+            # fallback caption below would blame an unreadable order status for
+            # what is really just a disconnected broker.
+            if not _schwab_live:
+                if st.session_state.get("_schwab_configured"):
+                    st.info(
+                        "📊 Reading from **"
+                        + ("Yahoo Finance" if provider == "yahoo" else "Moomoo")
+                        + "**. Live cost-to-close, P/L, order status and "
+                        "closing are Schwab-only — switch the data source to "
+                        "**Schwab** in the top bar to manage this trade at "
+                        "your broker.")
+                else:
+                    st.info(
+                        "📊 No broker connected. This record is tracked "
+                        "locally; live cost-to-close, order status and closing "
+                        "need Schwab — add your credentials to config.toml and "
+                        "run `schwab_auth.py`.")
             # Live re-quote for cost-to-close (Schwab, read-only) — fetched in
             # the parallel prefetch above; None when unavailable or timed out.
             q = quote_by_id.get(t.get("id"))
@@ -1432,10 +2186,14 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                 except Exception:
                     _meta = {}
                 _spot, _spct = _meta.get("spot"), _meta.get("pct_change")
-                # Annualized yield: a covered call is measured against spot (the
-                # shares are the capital); a cash-secured put against its strike
-                # (the cash collateral). Mirrors the scanner's Ann% convention.
-                _ann_base = _spot if _is_call else _strike
+                # Annualized yield over the capital the position ties up: a
+                # covered call against its net liquidation value (spot − mark,
+                # what unwinding would free), a cash-secured put against its
+                # strike. Every trade placed from the scanner's call dialog is
+                # share-covered by construction, so `covered` follows the right.
+                _ann_base = yield_base(_spot, _strike,
+                                       "C" if _is_call else "P",
+                                       q.get("mid"), covered=_is_call)
                 _ann = (q["mid"] / _ann_base * (365.0 / _dte) * 100.0
                         if (_dte and _dte > 0 and _ann_base and q.get("mid"))
                         else None)
@@ -1615,7 +2373,8 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                         "send — or simulate — a closing order for a live "
                         "position (that would desync the tracker from your open "
                         "broker position). Set `paper = false` in config.toml "
-                        "and restart to manage it.")
+                        "to manage it — applies on your next click here, no "
+                        "restart needed.")
                 else:
                     st.caption("🔴 LIVE close — sends a real buy-to-close order."
                                if close_live else
@@ -1635,10 +2394,10 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                 with _details_col:
                     _s1, _s2 = st.columns(2)
                     with _s1:
-                        st.markdown(_kv_table_html(_terms),
+                        st.markdown(kv_table_html(_terms),
                                     unsafe_allow_html=True)
                     with _s2:
-                        st.markdown(_kv_table_html(_prices),
+                        st.markdown(kv_table_html(_prices),
                                     unsafe_allow_html=True)
                     # Broker status + close disclaimer, below the contract
                     # details (to the left of the day chart).
@@ -1691,7 +2450,7 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                 # Fill / expiry handling lives in _settle_closing_trade, shared
                 # with the on-load reconciliation both tabs run — so a closing
                 # order settles the same way whether it's noticed here or on the
-                # Close tab. A note means it ended without fully filling.
+                # Positions tab. A note means it ended without fully filling.
                 _chg, _note = _settle_closing_trade(t, cbs)
                 if _chg:
                     if _note:
@@ -1857,8 +2616,17 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                                             valid=_valid)
                 if _valid:
                     close_limit, close_n = float(close_limit), int(close_n)
+                    st.caption(f"Cost to close at this limit: "
+                               f"**{money_md(close_limit * 100 * close_n)}**")
                 else:
                     st.error(_input_err)
+                # Only for a close that actually spends money. A paper close
+                # books a simulated result and sends nothing, so the account's
+                # balances have no bearing on it.
+                if close_live:
+                    render_buying_power_caption(
+                        scfg, "Account", f"trade_{t['id']}")
+
                 def _close_error(limit_v, n_v, _held=qty):
                     return trade_actions.close_input_error(limit_v, n_v, _held)
 
@@ -1985,9 +2753,12 @@ def _scanner_trades(provider: str, scfg: dict, market_open) -> None:
                 if _result:
                     (st.success if _result.get("ok") else st.error)(
                         _result["msg"].replace("$", "\\$"))
-            elif t.get("status") == "open":
+            elif t.get("status") == "open" and _schwab_live:
                 # Live order, but its broker status couldn't be read — can't
                 # tell working vs filled, so offer neither action automatically.
+                # Only when Schwab IS connected: off-broker, the notice at the
+                # top of the row already explains the blanks, and blaming the
+                # order status would point at the wrong thing.
                 st.caption("Order status unavailable — verify at your broker; "
                            "use **Remove from tracker** if it didn't fill.")
 

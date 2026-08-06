@@ -23,12 +23,15 @@
     --data-source-pill-left:   14rem;
     --data-source-pill-width:  28rem;     /* tune if Moomoo label width changes */
     --surface-fit-pill-left:   calc(var(--data-source-pill-left) + var(--data-source-pill-width) - 30px);
-    /* The ⚙️ Settings gear is anchored to the RIGHT edge instead of a left
-       offset: it renders on every tab, so a left offset would eventually
-       collide with the Single-Ticker-only surface-fit pill. Nudge this if it
-       overlaps Streamlit's own top-right chrome (the ⋮ menu / Deploy button)
-       in your window. Right-anchored, so it needs no --sidebar-shift rule. */
+    /* The top-right cluster (mode badge + ⚙️ Settings gear) is anchored to the
+       RIGHT edge instead of a left offset: it renders on every tab, so a left
+       offset would eventually collide with the Single-Ticker-only surface-fit
+       pill. Nudge this if it overlaps Streamlit's own top-right chrome (the ⋮
+       menu / Deploy button) in your window. Right-anchored, so it needs no
+       --sidebar-shift rule. The mode badge sits one gear-width further left;
+       the gear's label is kept short so that offset stays tight. */
     --settings-pill-right:     8.5rem;
+    --mode-pill-right:         calc(var(--settings-pill-right) + 5rem);
 
     /* z-index layering for the fixed-position pills. They sit above
        Streamlit's own chrome (which tops out around 999000). */
@@ -157,11 +160,42 @@ html[data-osc-theme="dark"] [class*="st-key-surface_fit_pill"] [role="radiogroup
     box-shadow: 0 1px 3px rgba(0,0,0,0.40) !important;
 }
 
-/* ⚙️ Settings gear — pinned to the top-right on every tab. Two container
-   keys share this positioning rule: `settings_pill` (nothing hidden) and
-   `settings_pill_on` (something is hidden — tinted amber below, so an active
-   blacklist is visible from any tab without opening the dialog). The
-   [class*=] prefix match catches both. */
+/* Mode badge (PAPER / LIVE) — pinned on the same header row as the ⚙️ gear,
+   just to its left. Two independently fixed elements sharing one `top`, NOT a
+   flex row inside a shared container: Streamlit's vertical block isn't a flex
+   box, so flex-direction:row on it was inert and the gear dropped onto its own
+   line, eating header height. Fixed positioning puts them on the same row by
+   construction, with no dependency on Streamlit's internal layout.
+   The gap between the two is small and predictable because the gear's label is
+   kept short ("⚙️", "⚙️ 3") — see settings_ui.render_settings_button. */
+[class*="st-key-mode_pill"] {
+    position: fixed;
+    top: var(--pill-top);
+    right: var(--mode-pill-right);
+    left: auto;
+    transform: none;
+    z-index: var(--z-pill);
+    width: auto !important;
+}
+.osc-mode-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 2.5rem;
+    padding: 0 0.7rem;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    box-shadow: 0 1px 3px rgba(15,23,42,0.10);
+}
+.osc-mode-paper { background: #334155; color: #cbd5e1; }
+.osc-mode-live  { background: #b91c1c; color: #ffffff; }
+
+/* ⚙️ Settings gear. Two container keys share the button styling below:
+   `settings_pill` (nothing hidden) and `settings_pill_on` (something is
+   hidden — tinted amber, so an active blacklist is visible from any tab
+   without opening the dialog). The [class*=] prefix match catches both. */
 [class*="st-key-settings_pill"] {
     position: fixed;
     top: var(--pill-top);

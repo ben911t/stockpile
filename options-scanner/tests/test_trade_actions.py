@@ -642,3 +642,49 @@ def test_place_roll_order_rejects_invalid_without_calling_broker():
     c = _FakeClient(place=_Resp(201))
     res = ta.place_roll_order(c, bad, "HASH")
     assert res["ok"] is False and c.placed is None
+
+
+# ── how the sizing figure is labeled (Sell Put dialog) ───────────────────────
+# "Avail Cash" was on every account type, but only a CASH account's figure is
+# actually cash — on a margin account it's availableFundsNonMarginableTrade,
+# which is not the cash balance and reads as more money than is sitting there.
+
+def test_cash_account_figure_is_labeled_cash():
+    cap = ta.AccountCapacity(cash_available=25_000.0)
+    assert cap.amount == 25_000.0
+    assert cap.amount_field == "cashAvailableForTrading"
+    assert cap.amount_label == "Avail Cash"
+    assert "cash available" in cap.amount_note.lower()
+
+
+def test_margin_account_figure_is_not_called_cash():
+    cap = ta.AccountCapacity(non_marginable=42_000.0)
+    assert cap.amount == 42_000.0
+    assert cap.amount_label == "Avail Funds"
+    assert "cash" not in cap.amount_label.lower()
+    assert "not your cash balance" in cap.amount_note
+
+
+def test_available_funds_fallback_is_not_called_cash():
+    cap = ta.AccountCapacity(available_funds=17_000.0)
+    assert cap.amount_field == "availableFunds"
+    assert cap.amount_label == "Avail Funds"
+    assert "not your cash balance" in cap.amount_note
+
+
+def test_cash_field_wins_when_both_are_present():
+    # A cash account can report both; the cash figure is the honest one.
+    cap = ta.AccountCapacity(cash_available=10_000.0, non_marginable=90_000.0)
+    assert cap.amount == 10_000.0 and cap.amount_label == "Avail Cash"
+
+
+def test_no_balances_has_no_note_and_a_neutral_label():
+    cap = ta.AccountCapacity()
+    assert cap.amount is None and cap.amount_field is None
+    assert cap.amount_note == "" and cap.amount_label == "Avail Funds"
+
+
+def test_buying_power_never_becomes_the_sizing_figure():
+    # Margin BP would over-size a cash-secured put; it stays informational.
+    cap = ta.AccountCapacity(buying_power=500_000.0)
+    assert cap.amount is None

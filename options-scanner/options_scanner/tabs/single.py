@@ -641,7 +641,7 @@ def tab_single() -> None:
         st.info(f"Rolling {res['roll_type']} {fmt_strike(res['roll_strike'])} "
                 f"{res['roll_exp_str']} — close cost (mid): **${rcc:.2f}**")
         st.caption("📋 Analysis only — to *place* a roll on a position you hold, "
-                   "use the **Roll** tab (live Schwab positions).")
+                   "use the **Positions** tab (live Schwab positions).")
 
     # Rescan button (fixed to header bar) + scan-criteria summary on
     # the same row. The button container is position:fixed via CSS so

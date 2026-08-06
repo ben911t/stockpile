@@ -1,4 +1,4 @@
-"""Hide selected broker option legs from the Close and Roll tabs.
+"""Hide selected broker option legs from the Positions tab.
 
 **Display only.** A hidden position is still held, still assignable, and still
 counts everywhere risk is computed. Coverage and sizing read the account
@@ -174,8 +174,16 @@ def rule_from_leg(leg: dict, note: str = "") -> dict:
     return rule
 
 
+def _right_word(option_type) -> str:
+    """"CALL" / "PUT" for display. Labels spell the right out — a bare "C" or
+    "P" next to a strike is easy to misread at a glance, and these labels are
+    what the Settings dialog shows when you decide what to hide."""
+    t = _norm_type(option_type)
+    return {"C": "CALL", "P": "PUT"}.get(t, "")
+
+
 def rule_label(rule: dict) -> str:
-    """Human-readable rule, e.g. ``UBER 2026-06-18 $120 C`` or
+    """Human-readable rule, e.g. ``UBER 2026-06-18 $120 CALL`` or
     ``WPC — all legs``. Partial rules read as what they actually cover."""
     ticker = _norm_ticker(rule.get("ticker")) or "?"
     parts = []
@@ -185,7 +193,7 @@ def rule_label(rule: dict) -> str:
         parts.append(_fmt_strike(rule["strike"]))
     opt = _norm_type(rule.get("option_type"))
     if opt:
-        parts.append(opt)
+        parts.append(_right_word(opt))
     if not parts:
         return f"{ticker} — all legs"
     if not (rule.get("expiration") and rule.get("strike") not in (None, "")
@@ -195,11 +203,11 @@ def rule_label(rule: dict) -> str:
 
 
 def leg_label(leg: dict) -> str:
-    """Human-readable held leg, e.g. ``UBER 2026-06-18 $120 C ×2 short``."""
+    """Human-readable held leg, e.g. ``UBER 2026-06-18 $120 CALL ×2 short``."""
     bits = [_norm_ticker(leg.get("underlying")) or "?",
             str(leg.get("expiration") or "?"),
             _fmt_strike(leg.get("strike")),
-            _norm_type(leg.get("option_type")) or "?"]
+            _right_word(leg.get("option_type")) or "?"]
     try:
         qty = int(leg.get("quantity") or 0)
         if qty:

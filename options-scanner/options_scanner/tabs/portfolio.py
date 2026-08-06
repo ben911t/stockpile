@@ -765,10 +765,10 @@ def _render_scan_tab(is_watchlist: bool, k: str) -> None:
         )
 
     # Roll scan mode is analysis only — the NetCr columns below show what a
-    # roll would net, but placing one happens on the dedicated Roll tab (live
+    # roll would net, but placing one happens on the Positions tab (live
     # Schwab positions).
     if stored_scan_mode == "roll":
-        st.caption("📋 Roll analysis only — to *place* a roll, use the **Roll** "
+        st.caption("📋 Roll analysis only — to *place* a roll, use the **Positions** "
                    "tab (live Schwab positions).")
 
     # ── Cross-ticker leaderboard — richest IV+pp across the whole basket ──────

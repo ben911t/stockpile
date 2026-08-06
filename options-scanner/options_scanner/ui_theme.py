@@ -28,6 +28,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Literal
 
@@ -756,6 +757,97 @@ def inject_theme() -> None:
     st.markdown(css, unsafe_allow_html=True)
 
 
+# Schwab's brand blue. Used only to mark the tabs that read a Schwab account —
+# it is not part of the app's own palette, which stays on --osc-primary. Dial
+# the two alphas below to taste; they're the whole knob.
+SCHWAB_BLUE = "0, 160, 223"          # #00A0DF as rgb parts, for rgba()
+_BROKER_TAB_IDLE = 0.30              # unselected chip — translucent, see below
+
+# The SELECTED chip is opaque, and deliberately not just a stronger alpha of the
+# same hue. Streamlit draws the selected label in white (it normally sits on a
+# filled dark background), and a translucent fill resolves against whichever
+# canvas is behind it: rgba(0,160,223,0.62) lands on #5EC2EA over the light
+# theme — white-on-that is 2.0:1, unreadable — and on #056B9A over the dark one,
+# which is fine. One opaque color renders identically on both. #0077A8 is
+# #00A0DF darkened until white text clears 4.5:1 (it reaches 5.0:1).
+_BROKER_TAB_ACTIVE_BG = "#0077A8"
+_BROKER_TAB_ACTIVE_FG = "#FFFFFF"
+
+
+def mark_broker_tabs(tab_names, broker_tabs) -> None:
+    """Fill the tab-bar chips whose tabs only do anything with a live broker.
+
+    Trades and Positions read a Schwab account; every other tab works off a
+    chain fetch or an uploaded CSV and is useful on any data source. Coloring
+    them as a group says which is which before you click and find an empty
+    table — the tab bar is the only place the distinction is visible.
+
+    Indices come from `tab_names` at call time rather than hard-coded, so
+    reordering or inserting a tab can't shift the fill onto its neighbour.
+
+    Three selector forms per chip, because the exact nesting isn't contractual:
+    options may be direct `button` children of the flex row, wrapped one level
+    down, or nested under the `stButtonGroup` element. They all address the same
+    element, so overlapping matches are harmless — and `nth-of-type` counts only
+    among siblings of the same type, so a hidden label element (this widget uses
+    `label_visibility="collapsed"`) can't shift the count.
+
+    Scoping is by `st-key-osc_tabbar`, which comes from our own
+    `st.container(key=...)` and so can't be renamed by a version bump. An
+    earlier attempt scoped to `[data-testid="stSegmentedControl"]` — a test id
+    Streamlit does not define — and silently matched nothing. The real ids are
+    `stButtonGroup` for the row and `stBaseButton-segmented_control` /
+    `…_controlActive` for the chips.
+
+    The selected chip gets a stronger fill of the same hue: Streamlit marks the
+    active option with its own background, which this would otherwise override
+    with `!important` and leave you unable to tell which broker tab is open.
+    """
+    idx = [i + 1 for i, name in enumerate(tab_names) if name in broker_tabs]
+    if not idx:
+        return
+    root = '[class*="st-key-osc_tabbar"]'
+
+    def _forms(n, active: bool) -> str:
+        # Active chips carry a distinct kind AND aria-checked; match either, so
+        # the stronger fill survives a change to whichever one Streamlit drops.
+        tail = ('[data-testid$="Active"]', '[aria-checked="true"]') if active \
+            else ("",)
+        out = []
+        for t in tail:
+            out += [f"{root} button:nth-of-type({n}){t}",
+                    f"{root} *:nth-of-type({n}) > button{t}",
+                    f'{root} [data-testid="stButtonGroup"] > *:nth-of-type({n}) '
+                    f"button{t}"]
+        return ", ".join(out)
+
+    idle = ", ".join(_forms(n, False) for n in idx)
+    active = ", ".join(_forms(n, True) for n in idx)
+    # The label sits in a child element (Streamlit wraps it in a <p>/<span>), so
+    # a color set on the button alone doesn't reach it — same reason the roll
+    # dialog's red Cancel button styles `button p` explicitly.
+    active_text = ", ".join(f"{s}, {s} p, {s} span" for s in active.split(", "))
+    st.markdown(
+        f"""
+        <style>
+        {idle} {{
+          background-color: rgba({SCHWAB_BLUE}, {_BROKER_TAB_IDLE}) !important;
+          border-radius: 6px !important;
+        }}
+        {active} {{
+          background-color: {_BROKER_TAB_ACTIVE_BG} !important;
+          border-radius: 6px !important;
+        }}
+        {active_text} {{
+          color: {_BROKER_TAB_ACTIVE_FG} !important;
+          font-weight: 600 !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ── Reusable rendering helpers ──────────────────────────────────────────────
 
 def df_height(obj, max_rows: int = 20) -> int:
@@ -1025,6 +1117,65 @@ def empty_state(title: str, subtitle: str = "") -> None:
         f"{sub_html}"
         f"</div>",
         unsafe_allow_html=True,
+    )
+
+
+def scroll_into_view(margin_top: int = 100, tries: int = 8,
+                     interval_ms: int = 180) -> None:
+    """Scroll the panel this is rendered at the top of into view.
+
+    Used when selecting a table row expands a detail section below it (the Roll
+    builder, the Close builder). Streamlit's markdown sanitizer strips element
+    ids, so an anchor-div can't be targeted — instead the component scrolls its
+    own iframe (``window.frameElement``) into view.
+
+    It **retries** rather than firing once. A single delayed shot worked for a
+    row near the top but not for the last row in a table: the detail renders
+    *below* the current document, so the page has to grow taller before there is
+    anywhere to scroll to, and by the time it does the one attempt has already
+    run. Each tick re-aims until the panel is actually on screen, which also
+    absorbs late layout shifts as widgets and dataframes mount.
+
+    Every call carries a fresh **nonce**. ``st.iframe`` takes no ``key``, so
+    Streamlit identifies the component purely by its payload and position — an
+    identical script at the same spot is reconciled as unchanged and the iframe
+    is never reloaded, so the JS doesn't run again. That is why selecting a
+    second row (after the first had already rendered this component) scrolled
+    nowhere. Varying the source guarantees a remount, and the guard at the call
+    site keeps that to once per new selection.
+
+    `margin_top` clears the fixed header/tab bar.
+    """
+    st.iframe(
+        """
+        <script>
+        // remount-nonce: __NONCE__
+        (function() {
+          const el = window.frameElement;
+          if (!el) return;
+          const win = window.parent;
+          el.style.scrollMarginTop = "__MARGIN__px";
+          let n = 0;
+          // Landed = the panel's top sits below the fixed header and inside the
+          // upper part of the viewport. Anywhere in that band means the user can
+          // see the detail, so stop nudging.
+          const landed = function() {
+            const top = el.getBoundingClientRect().top;
+            return top >= 0 && top <= win.innerHeight * 0.6;
+          };
+          const tick = function() {
+            if (landed()) return;
+            el.scrollIntoView({behavior: "smooth", block: "start"});
+            if (++n < __TRIES__) win.setTimeout(tick, __INTERVAL__);
+          };
+          win.setTimeout(tick, 120);
+        })();
+        </script>
+        """.replace("__MARGIN__", str(int(margin_top)))
+           .replace("__TRIES__", str(int(tries)))
+           .replace("__INTERVAL__", str(int(interval_ms)))
+           .replace("__NONCE__", uuid.uuid4().hex),
+        height=1, width=1,
     )
 
 

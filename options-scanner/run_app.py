@@ -19,6 +19,7 @@ from options_scanner.ui_theme import (
     disclaimer_chip,
     footer as ui_footer,
     inject_theme,
+    mark_broker_tabs,
     metric_card,
     register_altair_theme,
     section_header,
@@ -28,10 +29,10 @@ from options_scanner.settings_ui import render_settings_button
 from options_scanner.tabs.gex import tab_gex
 from options_scanner.tabs.live_charts import tab_live_charts
 from options_scanner.tabs.portfolio import tab_portfolio, tab_watchlist
-from options_scanner.tabs.rolls import tab_rolls
+from options_scanner.tabs.rolls import tab_positions
 from options_scanner.tabs.single import tab_single
 from options_scanner.tabs.spreads import tab_directional, tab_neutral, tab_spreads
-from options_scanner.tabs.trades import tab_trades, tab_close
+from options_scanner.tabs.trades import tab_trades
 
 _FAVICON_PATH = Path(__file__).parent / "assets" / "favicon.png"
 st.set_page_config(
@@ -291,7 +292,7 @@ st.session_state["data_source"] = data_source
 st.session_state["schwab_config"] = _cfg_schwab if data_source == "schwab" else None
 st.session_state["moomoo_config"] = _cfg_moomoo if data_source == "moomoo" else None
 # Whether Schwab is configured *at all* (independent of the active source) — the
-# Roll tab needs this to tell "no broker configured" from "Schwab not selected".
+# Positions tab needs this to tell "no broker configured" from "Schwab not selected".
 st.session_state["_schwab_configured"] = _schwab_configured
 # Schwab token file, so tabs can pass it to render_schwab_reauth_hint.
 st.session_state["_schwab_token_file"] = _cfg_schwab.get("token_file")
@@ -315,9 +316,29 @@ if data_source == "schwab" and _cfg_schwab:
         fetch_spot_meta.clear()
     st.session_state["_schwab_token_mtime"] = _cur_tok_mtime
 
-# ⚙️ Settings gear — pinned top-right, rendered on every tab (not just the
-# position tabs) so an active hidden-position blacklist is always in view. Must
-# come after `schwab_config` is seeded above: the dialog offers your live legs.
+# Header row, right side, on every tab: the PAPER/LIVE mode badge and the ⚙️
+# Settings gear. Two separately pinned elements sharing one `top` — see
+# styles.css for why they aren't a flex row in one container. Both must come
+# after `schwab_config` is seeded above: the dialog offers your live legs.
+#
+# The badge shows only when Schwab is configured — with no broker connected
+# nothing can be placed in either mode, so a "PAPER" chip would be stating
+# something that isn't in play.
+if _schwab_configured:
+    _paper_mode = bool(_cfg_schwab.get("paper", True))
+    _mode_tip = ("Paper mode (paper = true in config.toml) — placing a trade "
+                 "records a simulation; nothing is sent to your broker."
+                 if _paper_mode else
+                 "LIVE (paper = false) — placing a trade sends a REAL order to "
+                 "your broker.")
+    with st.container(key="mode_pill"):
+        st.markdown(
+            "<span class='osc-mode-badge "
+            + ("osc-mode-paper' " if _paper_mode else "osc-mode-live' ")
+            + f"title='{_mode_tip}'>"
+            + ("📝 PAPER" if _paper_mode else "🔴 LIVE")
+            + "</span>",
+            unsafe_allow_html=True)
 render_settings_button()
 
 
@@ -506,19 +527,26 @@ if _pending_toast:
 # regardless of how many exist, and each tab's live data loads when you arrive.
 # Switching tabs is a rerun (native st.tabs switched purely client-side); that
 # rerun is the cost of laziness, and the center spinner covers it.
-TAB_NAMES = ["Single Ticker", "Watchlist", "Trades", "Close", "Roll",
+TAB_NAMES = ["Single Ticker", "Watchlist", "Positions", "Trades",
              "Portfolio", "GEX", "Spreads", "Directional", "Neutral",
              "Live Charts"]
 TAB_FUNCS = {
     "Single Ticker": tab_single, "Watchlist": tab_watchlist,
-    "Trades": tab_trades, "Close": tab_close, "Roll": tab_rolls,
+    "Positions": tab_positions, "Trades": tab_trades,
     "Portfolio": tab_portfolio, "GEX": tab_gex, "Spreads": tab_spreads,
     "Directional": tab_directional, "Neutral": tab_neutral,
     "Live Charts": tab_live_charts,
 }
+# Tabs that read a live Schwab account rather than a chain or an uploaded CSV.
+# Tinted in the tab bar so the dependency is visible before you click. Positions
+# is empty without Schwab; Trades still lists locally-tracked trades and closes
+# paper ones, but everything broker-side (cost-to-close, P/L, order status,
+# closing a live position) needs it. Live Charts is NOT here — its panes take
+# Yahoo or Hyperliquid too, so Schwab is one option rather than a requirement.
+BROKER_TABS = {"Trades", "Positions"}
 
 # Programmatic tab switch requested by an action that then reran (e.g. placing a
-# trade from the watchlist dialog → "Trades", a roll from the Roll tab). Apply
+# trade from the watchlist dialog → "Trades", a roll from the Positions tab). Apply
 # it BEFORE the tab-bar widget instantiates so it becomes the selected tab —
 # this replaces the old JS that clicked the native tab button.
 st.session_state.setdefault("active_tab", TAB_NAMES[0])
@@ -529,7 +557,11 @@ if _goto_tab in TAB_NAMES:
 with st.container(key="osc_tabbar"):
     _sel = st.segmented_control(
         "Section", TAB_NAMES, label_visibility="collapsed", key="active_tab",
+        help="Blue tabs (Trades, Positions) read your live Schwab account — "
+             "they need Schwab configured *and* selected as the data source in "
+             "the top bar. Every other tab works on any source.",
     )
+mark_broker_tabs(TAB_NAMES, BROKER_TABS)
 
 # segmented_control returns None if the active chip is clicked again (deselect);
 # fall back to the last resolved tab so a page is always rendered. `active_tab`

@@ -1,6 +1,6 @@
 """Cached, read-only reads of the live broker option positions.
 
-One home for them so the **Close** tab, the **Roll** tab, and the ⚙️ **Settings**
+One home for them so the **Positions** tab and the ⚙️ **Settings**
 dialog share a single 60s cache instead of each paying its own Schwab
 round-trip — and so the dialog can ask what you hold without importing a tab
 module.
@@ -42,6 +42,44 @@ def option_positions(app_key: str, app_secret: str, callback_url: str,
     if client is None:
         return None
     return trade_actions.open_option_positions(client)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def stock_positions(app_key: str, app_secret: str, callback_url: str,
+                    token_file: str) -> list | None:
+    """Every stock position in the Schwab account, each with its covered-call
+    standing (see `trade_actions.classify_coverage`). The Positions tab's
+    stocks table. None when Schwab can't be reached — distinct from [], which
+    means "reached it, you hold no stock"."""
+    client = _client(app_key, app_secret, callback_url, token_file)
+    if client is None:
+        return None
+    return trade_actions.equity_positions(client)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def account_capacity(app_key: str, app_secret: str, callback_url: str,
+                     token_file: str) -> dict | None:
+    """Cached (60s) read-only account balances — cash, available funds and
+    buying power. None when the client can't be built or the read fails.
+
+    Shared by the Sell dialog (sizing a new position) and the Positions tab (can I
+    afford to buy this back?), so one fetch serves both. Keyed on the
+    credentials, so a re-auth busts it the same way it busts every other read.
+    """
+    from options_scanner import trade_actions
+    client = _client(app_key, app_secret, callback_url, token_file)
+    if client is None:
+        return None
+    cap = trade_actions.fetch_account_capacity(client)
+    if cap is None:
+        return None
+    return {"cash": cap.cash_available, "bp": cap.buying_power,
+            "amount": cap.amount, "type": cap.account_type,
+            "mask": cap.account_mask, "balances": cap.balances,
+            # What `amount` actually is, so callers can label it honestly — on a
+            # margin account it isn't the cash balance.
+            "amount_label": cap.amount_label, "amount_note": cap.amount_note}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
