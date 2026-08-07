@@ -81,3 +81,45 @@ def test_an_unusable_spot_gives_no_moneyness(spot):
 def test_a_junk_strike_gives_no_moneyness():
     assert signed_moneyness(34.0, None, "C") is None
     assert signed_moneyness(34.0, "n/a", "C") is None
+
+
+# ── where the color key sits ────────────────────────────────────────────────
+
+def _positions_src():
+    import inspect
+    from options_scanner.tabs import trades
+    src = inspect.getsource(trades._render_option_positions)
+    # Drop the docstring so prose about panels doesn't match as code.
+    body = src.split('"""', 2)
+    return body[2] if len(body) == 3 else src
+
+
+def test_the_color_key_renders_above_the_detail_panel():
+    # Selecting a row used to open the panel inside the table loop, which
+    # pushed the key below it — exactly when you'd want the key, since the
+    # shading you're reading is on the table you just clicked.
+    src = _positions_src()
+    assert src.index("moneyness_legend()") < src.index("render_detail(")
+
+
+def test_the_scroll_component_stays_with_the_panel():
+    # It scrolls its OWN iframe into view, so it has to render at the top of
+    # what it's bringing on screen. Left behind at the table it would aim at a
+    # point above the key instead of at the panel.
+    src = _positions_src()
+    assert src.index("moneyness_legend()") < src.index("_scroll_into_view()")
+    assert src.index("_scroll_into_view()") < src.index("render_detail(")
+
+
+def test_selections_are_collected_before_the_key_is_drawn():
+    # The deferral is what makes the ordering possible at all.
+    src = _positions_src()
+    assert "_pending.append(" in src
+    assert src.index("_pending.append(") < src.index("moneyness_legend()")
+
+
+def test_the_hidden_notice_still_comes_last():
+    # rindex, not index: the notice is also rendered on the "everything is
+    # hidden" early return, which is the first occurrence in the body.
+    src = _positions_src()
+    assert src.index("render_detail(") < src.rindex("render_hidden_notice(")

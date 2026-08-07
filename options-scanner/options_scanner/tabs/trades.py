@@ -1635,6 +1635,10 @@ def _render_option_positions(scfg: dict, provider: str, market_open,
     # splitting them keeps the sort within each kind. Each table maps its own
     # row index back to its own slice of `positions`, so a selection can't point
     # at the wrong leg.
+    # Selections are collected here and rendered *after* the color key below,
+    # so opening a detail panel doesn't shove the key down under it — the key
+    # explains the shading on the tables, so it belongs with them.
+    _pending: list[tuple] = []
     for _label, _is_call, _key in (("Puts", False, "opt_pos_put"),
                                    ("Calls", True, "opt_pos_call")):
         _subset, _sub = _split_by_right(positions, disp, _is_call)
@@ -1660,15 +1664,28 @@ def _render_option_positions(scfg: dict, provider: str, market_open,
         if not sel:
             st.session_state.pop(_scroll_guard, None)
             continue
-        if st.session_state.get(_scroll_guard) != sel[0]:
+        _fresh = st.session_state.get(_scroll_guard) != sel[0]
+        if _fresh:
             st.session_state[_scroll_guard] = sel[0]
-            _scroll_into_view()
-        st.markdown("---")
         # Reuse the spot already fetched for the table above (same cached
         # source), so the close panel's quote line can't disagree with the row.
         _sel_pos = _subset[sel[0]]
         _sel_spot = (meta.get(str(_sel_pos.get("underlying", ""))) or {}).get(
             "spot")
+        _pending.append((_sel_pos, _sel_spot, _fresh))
+
+    # Color key for the moneyness row shading — under both tables and ABOVE any
+    # detail panel, so selecting a row can't push the key out of sight.
+    moneyness_legend()
+
+    for _sel_pos, _sel_spot, _fresh in _pending:
+        # Scroll fires here rather than back at the table: the component scrolls
+        # its OWN iframe into view, so it has to sit at the top of the thing
+        # it's bringing on screen. Left at the detection site it would aim at a
+        # point above the key instead of at the panel.
+        if _fresh:
+            _scroll_into_view()
+        st.markdown("---")
         if render_detail is None:
             _render_option_close(_sel_pos, scfg, market_open, config_paper,
                                  _sel_spot, provider)
@@ -1676,9 +1693,6 @@ def _render_option_positions(scfg: dict, provider: str, market_open,
             render_detail(_sel_pos, scfg, provider, market_open, config_paper,
                           _sel_spot)
         st.markdown("---")
-
-    # Color key for the moneyness row shading (below both tables).
-    moneyness_legend()
 
     # Hidden-position note last, so it never pushes the table down.
     settings_ui.render_hidden_notice(_hidden, scope="positions")
