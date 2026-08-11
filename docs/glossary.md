@@ -15,6 +15,15 @@ current price of the underlying. Highest gamma here.
 **Call** — Option contract giving the holder the right to *buy* the
 underlying at the strike price by expiration.
 
+**Cash-secured put (CSP)** — Selling a put while setting aside enough
+cash to buy 100 shares per contract at the strike, so assignment is
+always affordable. You keep the premium; if the stock falls below the
+strike you may be assigned the shares.
+
+**Covered call** — Selling a call against 100 shares per contract that
+you already own. The shares "cover" the obligation to deliver, capping
+your upside at the strike in exchange for the premium.
+
 **DTE** — Days to expiration. Calendar days remaining until the
 option contract expires.
 
@@ -27,6 +36,12 @@ be exercised any day before expiration.
 **Expiration** — Date the option contract terminates. After
 expiration, the option is exercised, assigned, or expires worthless.
 
+**Intrinsic value / Time value** — The two halves of an option's price.
+*Intrinsic* is what it would be worth exercised right now (zero for an
+OTM option); *time value* (extrinsic) is the rest — what buyers pay for
+the chance of further movement. Time value is what decays to zero by
+expiration, and what a seller closing early hands back.
+
 **ITM (In the Money)** — Option with intrinsic value. Calls with
 strike below spot; puts with strike above spot.
 
@@ -34,6 +49,11 @@ strike below spot; puts with strike above spot.
 expirations roughly 9+ months out. Often have thin volume, which
 makes last-trade-based data sources (like Yahoo Finance) particularly
 unreliable for them.
+
+**Moneyness** — How far in or out of the money an option is, usually
+as a percentage of spot rather than in dollars, so strikes on a $40
+stock and a $400 stock are comparable. The scanner's Positions table
+shades and sorts by ITM%.
 
 **OTM (Out of the Money)** — Option with no intrinsic value, only
 extrinsic (time + IV). Calls with strike above spot; puts with
@@ -51,6 +71,12 @@ Commonly done to extend a winning trade or repair a losing one.
 
 **Strike price** — The price at which the option holder can buy
 (call) or sell (put) the underlying if they exercise.
+
+**Unwind** — Exiting both halves of a covered position at once: buying
+back the short call *and* selling the shares behind it. Done as a single
+net-price order, both legs fill together, so there's never a window
+where the call is closed but you still hold the stock (or the shares are
+gone and the call is left naked).
 
 ## Implied volatility & pricing
 

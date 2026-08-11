@@ -23,13 +23,15 @@ options-scanner/watchlists/*.json
 # Brokerage CSV exports
 *.csv
 
-# Brokerage statement PDFs
-input/**/*.pdf
-input/*.pdf
-
-# Brokerage CSV backups
-input/**/*.bak
-input/*.bak
+# Brokerage exports, statements, and working notes — personal account data.
+# Ignore EVERYTHING dropped into input/, keeping only the few files the repo
+# ships. Previously just *.pdf and *.bak under here were ignored, so anything
+# else (e.g. input/one_off/444_TODO.md) turned up as a commit candidate even
+# though CLAUDE.md documents input/ as gitignored.
+input/*
+!input/.gitkeep
+!input/README.md
+!input/stockpile.csv.example
 
 # Logs
 *.log
@@ -45,6 +47,8 @@ output/
 # Allow trading-dashboard templates to be tracked
 !trading-dashboard/templates/
 !trading-dashboard/templates/**
+# Track the scanner trading test plan (interactive tracker, source of truth)
+!options-scanner/TRADING_TEST_PLAN.html
 
 # Scanner persistent cache (IV-history SQLite store, etc.)
 cache/
@@ -52,6 +56,9 @@ options-scanner/cache/
 
 # Assisted put-selling trade log (personal trade data)
 options-scanner/trades/
+
+# User preferences written by the ⚙️ Settings dialog (hidden positions, …)
+options-scanner/settings/
 
 # Images
 *.png

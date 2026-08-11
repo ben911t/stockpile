@@ -137,7 +137,12 @@ class TestAdjCostBasisLayout:
         current_values = sections["A3:B6"]
         label, formula = current_values[1]
         assert label.startswith("** Adj Cost Basis")
-        assert "/E5" in formula
+        # Closed: shares held is 0, so the formula can't divide by E5.
+        # It divides the net cost (all-in net minus the stock-sale
+        # proceeds) by the total shares bought instead.
+        assert "/E5" not in formula
+        assert '="Sell")*J' in formula   # sale proceeds excluded from cost
+        assert '="Buy")*G' in formula    # denominator = shares bought
 
 
 class TestStockPositionLayout:

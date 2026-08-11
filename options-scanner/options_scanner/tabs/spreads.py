@@ -31,7 +31,7 @@ from options_scanner.fetch import fetch_and_enrich
 from options_scanner.format import fmt_strike
 from options_scanner.mc_ui import LegSpec, position_from_legs, render_mc_panel
 from options_scanner.ui_theme import (
-    metric_card, render_schwab_reauth_hint, section_header,
+    df_height, metric_card, render_schwab_reauth_hint, section_header,
 )
 
 
@@ -192,6 +192,7 @@ def _show_spreads_table(
         on_select="rerun",
         selection_mode="single-row",
         key=f"{key_prefix}_tbl_{strategy_name.replace(' ', '_').replace('/', '_').replace('×', 'x')}",
+        height=df_height(styled),
     )
     stamp_caption()
     if truncated:

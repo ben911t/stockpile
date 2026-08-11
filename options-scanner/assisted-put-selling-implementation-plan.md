@@ -5,16 +5,31 @@ doc is the build/design plan; the YouTube concept lives in the sibling
 private repo at
 `../stockpile-private/options-scanner/youtube/ep9-place-put-trades/script.md`.
 
+> **Status: DELIVERED and since superseded — kept as a design record.**
+> Every phase below shipped; put-selling went live 2026-06-17. The work
+> that followed widened it past this plan's original scope: covered-call
+> selling (**Sell Call**), and a **Positions** tab that closes, rolls,
+> and unwinds any live Schwab leg — so guardrail 1 below ("sell puts
+> only, no calls, no multi-leg") no longer describes the code. Read this
+> for *why* the gates are shaped the way they are; read `README.md`,
+> `SCHWAB_DATA_SOURCE.md`, and the "Order entry" section of `CLAUDE.md`
+> for what the app does today.
+
 ## Hard guardrails (enforce in code, not just UI)
 
 1. **Sell puts only.** Single-leg, sell-to-open, cash-secured puts. No
    buys, no calls, no multi-leg — reject anything else before it can
    reach the order builder, even if the Schwab API would accept it.
+   *(Superseded: covered calls, rolls, and unwinds all ship now. What
+   survived is the principle — each order type gets its own validated
+   builder, and nothing reaches Schwab that a builder didn't construct.)*
 2. **Human approval always.** The scanner recommends; it never fires.
    Every order stops at a "Place Trade" button the user clicks.
+   *(Still true, and now formalized in `confirm_gate.py`: Confirm arms,
+   Place sends, and any edit disarms.)*
 3. **Schwab only.** Placing orders needs Schwab trading scope beyond the
    read-only quotes Yahoo/Schwab give us today. The whole flow is
-   Schwab-gated.
+   Schwab-gated. *(Still true.)*
 
 ## Scope today (what's built — DONE)
 
@@ -45,11 +60,12 @@ private repo at
   recorded put-sells with live **cost-to-close** + **unrealized P/L**
   (Schwab re-quote) and a **closing-order preview**.
 
-The ONE thing deliberately left off: **actual order submission**. No
-`client.place_order` call exists anywhere; the Place Trade and Place
-Closing Trade buttons are disabled. Everything else is built around that
-gate. Live re-quote runs in the Trades tab; the dialog still assesses the
-scan snapshot. The Trades tab stays empty until placement is enabled.
+The ONE thing deliberately left off *at the time this was written*:
+**actual order submission** — no `client.place_order` call existed
+anywhere, and the Place buttons were disabled. Everything else was built
+around that gate. **That gate has since been opened** — see Phase 2.5
+below, which was implemented as sketched; the app places live orders
+today.
 
 ## Phase 1 — Fill-quality check (read-only, no order)
 

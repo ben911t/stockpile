@@ -38,6 +38,21 @@ def _trade_age_days(last_trade) -> float:
         return float("nan")
 
 
+def _trade_epoch_ms(last_trade) -> float:
+    """Epoch **milliseconds** of a yfinance lastTradeDate timestamp; 0 if
+    unusable. Feeds the pre-confirm "Last @ time" annotation. A tz-naive
+    timestamp is read as UTC (yfinance normally sends tz-aware)."""
+    try:
+        if last_trade is None or pd.isna(last_trade):
+            return 0.0
+        ts = pd.Timestamp(last_trade)
+        if ts.tz is None:
+            ts = ts.tz_localize("UTC")
+        return float(ts.timestamp() * 1000.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _fetch_chain_yahoo(ticker: str, opt_type: str = "both",
                        min_dte: int = 30,
                        max_dte: int | None = 90) -> pd.DataFrame:
@@ -104,6 +119,7 @@ def _fetch_chain_yahoo(ticker: str, opt_type: str = "both",
                 vega = _bs_vega(spot, K, T, _RISK_FREE_RATE, iv)
                 built = build_option_row(
                     last_trade_days=_trade_age_days(row.get("lastTradeDate")),
+                    last_trade_ms=_trade_epoch_ms(row.get("lastTradeDate")),
                     side=side, strike=K, expiration=exp_str,
                     dte=dte, spot=spot,
                     bid=safe_float(row.get("bid")),

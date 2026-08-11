@@ -31,7 +31,17 @@ Or use the helper scripts from this directory (they call `uv run`):
 - POSIX (macOS / Linux): ./run.sh
 - Windows: run.cmd
 
-The app listens on 0.0.0.0:5000 by default.
+The app listens on 0.0.0.0:5000 by default. Set `OSC_DASHBOARD_PORT` to
+move it if 5000 is taken — the Flask app, the repo-root `run.py`
+launcher, and the scanner's embed all read the same variable, so they
+stay in sync.
+
+To run this dashboard **and** the options scanner together, use
+`uv run run.py` from the repo root instead; the dashboard then also
+appears as the scanner's **Live Charts** tab at :8501, and stays
+directly reachable at :5000. For remote or reverse-proxy setups, set
+`OSC_DASHBOARD_URL` to the full URL the browser should embed — it takes
+precedence over `OSC_DASHBOARD_PORT`.
 
 Startup layout (config.toml)
 The startup layout — how many panes open and what each one shows — is

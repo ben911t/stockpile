@@ -23,6 +23,15 @@
     --data-source-pill-left:   14rem;
     --data-source-pill-width:  28rem;     /* tune if Moomoo label width changes */
     --surface-fit-pill-left:   calc(var(--data-source-pill-left) + var(--data-source-pill-width) - 30px);
+    /* The top-right cluster (mode badge + ⚙️ Settings gear) is anchored to the
+       RIGHT edge instead of a left offset: it renders on every tab, so a left
+       offset would eventually collide with the Single-Ticker-only surface-fit
+       pill. Nudge this if it overlaps Streamlit's own top-right chrome (the ⋮
+       menu / Deploy button) in your window. Right-anchored, so it needs no
+       --sidebar-shift rule. The mode badge sits one gear-width further left;
+       the gear's label is kept short so that offset stays tight. */
+    --settings-pill-right:     8.5rem;
+    --mode-pill-right:         calc(var(--settings-pill-right) + 5rem);
 
     /* z-index layering for the fixed-position pills. They sit above
        Streamlit's own chrome (which tops out around 999000). */
@@ -151,11 +160,150 @@ html[data-osc-theme="dark"] [class*="st-key-surface_fit_pill"] [role="radiogroup
     box-shadow: 0 1px 3px rgba(0,0,0,0.40) !important;
 }
 
+/* Mode badge (PAPER / LIVE) — pinned on the same header row as the ⚙️ gear,
+   just to its left. Two independently fixed elements sharing one `top`, NOT a
+   flex row inside a shared container: Streamlit's vertical block isn't a flex
+   box, so flex-direction:row on it was inert and the gear dropped onto its own
+   line, eating header height. Fixed positioning puts them on the same row by
+   construction, with no dependency on Streamlit's internal layout.
+   The gap between the two is small and predictable because the gear's label is
+   kept short ("⚙️", "⚙️ 3") — see settings_ui.render_settings_button. */
+[class*="st-key-mode_pill"] {
+    position: fixed;
+    top: var(--pill-top);
+    right: var(--mode-pill-right);
+    left: auto;
+    transform: none;
+    z-index: var(--z-pill);
+    width: auto !important;
+}
+.osc-mode-badge {
+    display: inline-flex;
+    align-items: center;
+    height: 2.5rem;
+    padding: 0 0.7rem;
+    border-radius: 8px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+    box-shadow: 0 1px 3px rgba(15,23,42,0.10);
+}
+.osc-mode-paper { background: #334155; color: #cbd5e1; }
+.osc-mode-live  { background: #b91c1c; color: #ffffff; }
+
+/* ⚙️ Settings gear. Two container keys share the button styling below:
+   `settings_pill` (nothing hidden) and `settings_pill_on` (something is
+   hidden — tinted amber, so an active blacklist is visible from any tab
+   without opening the dialog). The [class*=] prefix match catches both. */
+[class*="st-key-settings_pill"] {
+    position: fixed;
+    top: var(--pill-top);
+    right: var(--settings-pill-right);
+    left: auto;
+    transform: none;
+    z-index: var(--z-pill);
+    width: auto !important;
+}
+[class*="st-key-settings_pill"] .stButton > button {
+    padding: 0.3rem 0.85rem !important;
+    min-height: 2.5rem;
+    border-radius: 8px !important;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 1px 3px rgba(15,23,42,0.10);
+    border: 1px solid #DBEAFE;
+    font-weight: 500;
+    white-space: nowrap;
+}
+/* Something is hidden — amber, so it reads as a state, not a nav button. */
+[class*="st-key-settings_pill_on"] .stButton > button {
+    background: #FEF3C7;
+    border-color: #F59E0B;
+}
+[class*="st-key-settings_pill_on"] .stButton > button p {
+    color: #92400E !important;
+    font-weight: 600;
+}
+html[data-osc-theme="dark"] [class*="st-key-settings_pill"] .stButton > button {
+    background: rgba(30, 41, 59, 0.92);
+    border-color: #334155;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.40);
+}
+html[data-osc-theme="dark"] [class*="st-key-settings_pill_on"] .stButton > button {
+    background: rgba(120, 53, 15, 0.92);
+    border-color: #B45309;
+}
+html[data-osc-theme="dark"] [class*="st-key-settings_pill_on"] .stButton > button p {
+    color: #FDE68A !important;
+}
+
 /* Primary-button + data-source-pill accent recoloring is injected
    as a separate dynamic st.html() call in run_app.py with literal
    hex values. CSS custom properties (var(--primary)) don't resolve
    reliably across Streamlit's injection boundary, so the colors
    must be baked into the rule text each rerun. */
+
+/* A disabled button must LOOK disabled.
+   Those accent rules paint every [kind="primary"] button with !important and
+   don't exclude :disabled — so a grayed-out "Confirm Closing Trade" (disabled
+   because the order is already armed, or because the market is shut) rendered
+   in full accent color and read as clickable, sitting right beside the live
+   "Place Closing Trade". The two-step gate was working; it just didn't look
+   like it.
+   Specificity matters here: `.stButton > button[kind="primary"]` in the dynamic
+   block is (0,2,1) and is injected AFTER this file, so a mere :disabled at the
+   same weight would lose the tie. Adding the attribute *and* the pseudo-class
+   makes these (0,3,1), which wins regardless of injection order.
+   Both selector families are covered — [kind=…] and [data-testid=…] — because
+   Streamlit has moved the marker between versions and the accent block hedges
+   the same way. Whichever one the installed version emits, the disabled rule
+   for it outranks the accent rule for it. */
+.stButton > button[kind="primary"]:disabled,
+.stButton > button[kind="secondary"]:disabled,
+.stButton > button[kind="primary"][disabled],
+.stButton > button[kind="secondary"][disabled],
+button[data-testid="stBaseButton-primary"]:disabled,
+button[data-testid="stBaseButton-secondary"]:disabled,
+button[data-testid="stBaseButton-primary"][disabled],
+button[data-testid="stBaseButton-secondary"][disabled] {
+    background-color: #E2E8F0 !important;
+    border-color: #CBD5E1 !important;
+    color: #94A3B8 !important;
+    box-shadow: none !important;
+    cursor: not-allowed !important;
+}
+.stButton > button[kind="primary"]:disabled p,
+.stButton > button[kind="secondary"]:disabled p,
+.stButton > button[kind="primary"][disabled] p,
+.stButton > button[kind="secondary"][disabled] p,
+button[data-testid="stBaseButton-primary"]:disabled p,
+button[data-testid="stBaseButton-secondary"]:disabled p,
+button[data-testid="stBaseButton-primary"][disabled] p,
+button[data-testid="stBaseButton-secondary"][disabled] p {
+    color: #94A3B8 !important;
+}
+html[data-osc-theme="dark"] .stButton > button[kind="primary"]:disabled,
+html[data-osc-theme="dark"] .stButton > button[kind="secondary"]:disabled,
+html[data-osc-theme="dark"] .stButton > button[kind="primary"][disabled],
+html[data-osc-theme="dark"] .stButton > button[kind="secondary"][disabled],
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-primary"]:disabled,
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-secondary"]:disabled,
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-primary"][disabled],
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-secondary"][disabled] {
+    background-color: #1E293B !important;
+    border-color: #334155 !important;
+    color: #64748B !important;
+}
+html[data-osc-theme="dark"] .stButton > button[kind="primary"]:disabled p,
+html[data-osc-theme="dark"] .stButton > button[kind="secondary"]:disabled p,
+html[data-osc-theme="dark"] .stButton > button[kind="primary"][disabled] p,
+html[data-osc-theme="dark"] .stButton > button[kind="secondary"][disabled] p,
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-primary"]:disabled p,
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-secondary"]:disabled p,
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-primary"][disabled] p,
+html[data-osc-theme="dark"] button[data-testid="stBaseButton-secondary"][disabled] p {
+    color: #64748B !important;
+}
 
 /* ── Dark mode overrides for fixed-position / layout elements ─────────── */
 /* ── Dark mode — fixed-position elements ─────────────────────────────── */

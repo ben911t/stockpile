@@ -109,10 +109,16 @@ def tab_single() -> None:
             if entry.get("flow") == "roll"
             else "Find new options"
         )
-        st.session_state["s_min_dte"] = max(1, int(entry.get("min_dte", 30)))
-        st.session_state["s_max_dte"] = int(entry.get("max_dte", 90))
-        st.session_state["s_min_oi"]  = int(entry.get("min_oi", 1))
-        st.session_state["s_min_vol"] = int(entry.get("min_vol", 1))
+        # 0 / absent in a saved entry means "no floor / no maximum" on each of
+        # these — restore the field as *cleared*, which is what produced the 0.
+        for _key, _saved in (
+            ("s_min_dte", entry.get("min_dte", 30)),
+            ("s_max_dte", entry.get("max_dte", 90)),
+            ("s_min_oi",  entry.get("min_oi", 1)),
+            ("s_min_vol", entry.get("min_vol", 1)),
+        ):
+            _val = int(_saved or 0)
+            st.session_state[_key] = _val if _val > 0 else None
         st.session_state["s_delta"]   = (_dmin, _dmax)
         st.session_state["s_top"]     = int(entry.get("top_n", 10))
         if entry.get("flow") == "roll":
@@ -204,25 +210,40 @@ def tab_single() -> None:
                 render_outlook_card(buy, option_type)
 
     # ── Group 3: Filters ──────────────────────────────────────────────────────
+    # The four numeric floors/ceilings (Min DTE, Max DTE, Min OI, Min Vol) are
+    # all *nullable*: an empty box means "don't filter on this", not "reset me
+    # to the default". Each seeds its default into session state once, then
+    # renders with value=None — a plain value=N can't be cleared (it snaps back
+    # on the next rerun), and value=None without the seed would show an empty
+    # box on first load. Normalized to ints below; an empty box reads as 0.
+    for _k, _default in (("s_min_dte", 30), ("s_max_dte", 90),
+                         ("s_min_oi", 1), ("s_min_vol", 1)):
+        if _k not in st.session_state:
+            st.session_state[_k] = _default
+
     with st.container(border=True):
         n1, n2, n3, n4, n5, n6 = st.columns(
             [1, 1, 1, 1, 2, 1], vertical_alignment="top",
         )
         with n1:
-            min_dte = st.number_input("Min DTE", value=30, min_value=1,
-                                      key="s_min_dte")
+            min_dte = st.number_input(
+                "Min DTE", value=None, min_value=0, key="s_min_dte",
+                help="Clear the field for no minimum.")
         with n2:
-            max_dte_inp = st.number_input("Max DTE", value=90, min_value=0,
-                                          help="0 = no limit; otherwise ≥ Min DTE",
-                                          key="s_max_dte")
+            max_dte_inp = st.number_input(
+                "Max DTE", value=None, min_value=1, key="s_max_dte",
+                help="Clear the field for no maximum; otherwise ≥ Min DTE.")
         with n3:
-            min_oi = st.number_input("Min OI", value=1, min_value=0,
-                                     key="s_min_oi")
+            min_oi = st.number_input(
+                "Min OI", value=None, min_value=0, key="s_min_oi",
+                help="Contracts outstanding. Clear the field for no open-"
+                     "interest floor.")
         with n4:
             min_vol = st.number_input(
-                "Min Vol", value=1, min_value=0,
-                key="s_min_vol",
-            )
+                "Min Vol", value=None, min_value=0, key="s_min_vol",
+                help="Contracts traded today. Clear the field for no volume "
+                     "floor — volume is 0 across the whole chain while the "
+                     "market is closed.")
         with n5:
             delta_range = st.slider("Delta Range (abs value)", 0.0, 1.0,
                                     default_delta_range(False), step=0.05,
@@ -230,6 +251,15 @@ def tab_single() -> None:
         with n6:
             top_n = st.number_input("Top N", value=10, min_value=1,
                                     max_value=50, key="s_top")
+
+    # An emptied box returns None from st.number_input, and int(None) raises.
+    # 0 is the no-op value for all three: DTE ≥ 0 and OI/volume ≥ 0 filter
+    # nothing (both counts are non-negative ints off `safe_int`). Max DTE is
+    # normalized inside the scan block — None there means "no ceiling", which
+    # is not 0.
+    min_dte_val = int(min_dte) if min_dte is not None else 0
+    min_oi_val  = int(min_oi)  if min_oi  is not None else 0
+    min_vol_val = int(min_vol) if min_vol is not None else 0
 
     # ── Surface fit preset pill ───────────────────────────────────────────────
     preset = _surface_fit_controls()
@@ -398,10 +428,10 @@ def tab_single() -> None:
             st.session_state.pop("single_results", None)
             return
 
-        if 0 < int(max_dte_inp) < int(min_dte):
+        if max_dte_inp is not None and int(max_dte_inp) < min_dte_val:
             st.error(
                 f"Max DTE ({int(max_dte_inp)}) must be ≥ Min DTE "
-                f"({int(min_dte)}), or 0 for no limit."
+                f"({min_dte_val}), or clear it for no limit."
             )
             st.session_state.pop("single_results", None)
             return
@@ -415,12 +445,15 @@ def tab_single() -> None:
             eff_opt_fetch = opt_map[option_type]
             eff_mode      = mode_map[option_type]
 
-        max_dte_arg = int(max_dte_inp) if max_dte_inp > 0 else None
+        max_dte_arg = int(max_dte_inp) if max_dte_inp is not None else None
+        # Persisted form for the Recent Scans store: 0 = "no maximum" (the store
+        # and its recall/display read 0/absent as unbounded).
+        max_dte_store = int(max_dte_inp) if max_dte_inp is not None else 0
         delta_min, delta_max = delta_range
 
         with st.spinner(f"Fetching {ticker_clean} option chain…"):
             df, earnings_dates, err = fetch_and_enrich(
-                ticker_clean, eff_opt_fetch, int(min_dte), max_dte_arg,
+                ticker_clean, eff_opt_fetch, min_dte_val, max_dte_arg,
                 st.session_state.get("data_source", "yahoo"),
                 st.session_state.get("schwab_config"),
                 surface_filter_config, algo_config, score_config,
@@ -437,7 +470,7 @@ def tab_single() -> None:
             return
         if df.empty:
             st.warning(
-                f"**{ticker_clean}:** No options found for DTE {int(min_dte)}–"
+                f"**{ticker_clean}:** No options found for DTE {min_dte_val}–"
                 f"{int(max_dte_inp) if max_dte_inp else '∞'}. "
                 "Try widening the DTE range or check that the ticker has listed options."
             )
@@ -512,10 +545,10 @@ def tab_single() -> None:
             "roll_close_cost": roll_close_cost,
             "delta_min": delta_min,
             "delta_max": delta_max,
-            "min_dte": int(min_dte),
-            "max_dte": int(max_dte_inp),
-            "min_oi": int(min_oi),
-            "min_vol": int(min_vol),
+            "min_dte": min_dte_val,
+            "max_dte": max_dte_store,
+            "min_oi": min_oi_val,
+            "min_vol": min_vol_val,
             "top_n": int(top_n),
             "roll_exp_str": roll_exp.strftime("%Y-%m-%d") if rolling else None,
             "roll_strike": roll_strike if rolling else None,
@@ -529,10 +562,10 @@ def tab_single() -> None:
         # restored on recall and so the dedup key distinguishes scans
         # that differ only in OI/vol/DTE.
         _shared = {
-            "min_dte":   int(min_dte),
-            "max_dte":   int(max_dte_inp),
-            "min_oi":    int(min_oi),
-            "min_vol":   int(min_vol),
+            "min_dte":   min_dte_val,
+            "max_dte":   max_dte_store,
+            "min_oi":    min_oi_val,
+            "min_vol":   min_vol_val,
             "delta_min": delta_min,
             "delta_max": delta_max,
             "top_n":     int(top_n),
@@ -552,10 +585,10 @@ def tab_single() -> None:
                 "ticker":      ticker_clean,
                 "buy":         buy,
                 "option_type": option_type,
-                "min_dte":     int(min_dte),
-                "max_dte":     int(max_dte_inp),
-                "min_oi":      int(min_oi),
-                "min_vol":     int(min_vol),
+                "min_dte":     min_dte_val,
+                "max_dte":     max_dte_store,
+                "min_oi":      min_oi_val,
+                "min_vol":     min_vol_val,
                 "delta_min":   delta_min,
                 "delta_max":   delta_max,
                 "top_n":       int(top_n),
@@ -628,6 +661,8 @@ def tab_single() -> None:
     if rcc is not None:
         st.info(f"Rolling {res['roll_type']} {fmt_strike(res['roll_strike'])} "
                 f"{res['roll_exp_str']} — close cost (mid): **${rcc:.2f}**")
+        st.caption("📋 Analysis only — to *place* a roll on a position you hold, "
+                   "use the **Positions** tab (live Schwab positions).")
 
     # Rescan button (fixed to header bar) + scan-criteria summary on
     # the same row. The button container is position:fixed via CSS so
@@ -693,9 +728,33 @@ def tab_single() -> None:
                           res.get("min_vol", 0), top_ranks=top_ranks)
 
     st.subheader("Top candidates — all chains")
+    # Assisted sell (Schwab, sell mode, not rolling): make these rows selectable
+    # so a covered call / cash-secured put can be placed straight from here. For
+    # calls the ticker's live Schwab share coverage gates selectability.
+    _inv_ctx = None
+    _ds = st.session_state.get("data_source", "yahoo")
+    _scfg = st.session_state.get("schwab_config") or {}
+    if _ds == "schwab" and not buy_r and rcc is None and _scfg.get("app_key"):
+        _cov = None
+        if mode_r in ("call", "both"):
+            from options_scanner.display.leaderboard import coverage_map
+            _cmap = coverage_map(_scfg.get("app_key", ""),
+                                 _scfg.get("app_secret", ""),
+                                 _scfg.get("callback_url", ""),
+                                 _scfg.get("token_file", ""))
+            _cov = (_cmap or {}).get(str(ticker_r).upper())
+        _inv_ctx = {
+            "ticker": ticker_r,
+            "ticker_df": df_fit_full,
+            "provider": _ds,
+            "next_earnings": ed[0] if ed else None,
+            "spot": spot,
+            "key_prefix": f"single_{ticker_r}",
+            "coverage": _cov,
+        }
     show_scan_results(df_filt, mode_r, buy_r, rcc,
                        res["min_oi"], res["top_n"],
-                       res.get("min_vol", 0))
+                       res.get("min_vol", 0), investigate_ctx=_inv_ctx)
 
     # ── Monte Carlo trade analyzer ────────────────────────────────────────
     # Pick any candidate from the ranked table above and simulate its
